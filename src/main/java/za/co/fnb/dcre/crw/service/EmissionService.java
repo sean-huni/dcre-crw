@@ -50,13 +50,14 @@ public class EmissionService {
         }
         int emitted = 0;
         for (var entry : byArrival.entrySet()) {
-            emitOne(entry.getKey(), runDate, entry.getValue());
-            emitted++;
+            if (emitOne(entry.getKey(), runDate, entry.getValue())) {
+                emitted++;
+            }
         }
         return emitted;
     }
 
-    private void emitOne(UUID arrivalId, LocalDate runDate, List<DueRow> due) throws IOException {
+    private boolean emitOne(UUID arrivalId, LocalDate runDate, List<DueRow> due) throws IOException {
         String client = due.get(0).client();
         String msgId = due.get(0).msgId();
         String fileName = client + "_" + msgId + "_PAIN008.xml";
@@ -64,6 +65,12 @@ public class EmissionService {
         CrwEmissionEntity candidate = CrwEmissionEntity.planned(arrivalId, runDate, fileName);
         emissions.claimSnapshot(candidate);
         CrwEmissionEntity emission = emissions.findByArrivalIdAndRunDate(arrivalId, runDate).orElseThrow();
+        if ("VISIBLE".equals(emission.getState())) {
+            // Already handed to Fintegrate by an earlier window of this run date:
+            // a later window MUST NOT re-emit (duplicate collection order). Restart
+            // rebuilds still happen below while the state is pre-VISIBLE.
+            return false;
+        }
         if ("PLANNED".equals(emission.getState())) {
             for (DueRow row : due) {
                 members.addMember(CrwEmissionMemberEntity.of(emission.getId(), row.sequence(),
@@ -78,5 +85,6 @@ public class EmissionService {
         List<String> xml = painWriter.build(msgId, snapshot, controlSum);
         StagedWrite.write(Path.of(exchangeRoot, "fint-req", fileName), xml);
         emissions.transition(emission.getId(), "VISIBLE");
+        return true;
     }
 }

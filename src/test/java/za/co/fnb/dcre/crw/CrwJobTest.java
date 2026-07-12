@@ -88,8 +88,10 @@ class CrwJobTest {
                 "only the 3 odd (due-today) rows emitted; futured rows warehoused (R-37)");
         assertTrue(xml.stream().anyMatch(l -> l.contains("<Cd>TT2</Cd>")), "R-02 TT2 assertion slot");
 
-        // Snapshot immutability (R-24): another row becomes due, file deleted, rerun -> SAME members.
+        // Snapshot immutability (R-24): another row becomes due, the write is rolled
+        // back to a pre-VISIBLE crash state, file deleted, rerun -> SAME members.
         jdbc.update("UPDATE cde_schedule SET process_date='2026-07-12' WHERE arrival_id=? AND sequence=2", arrival);
+        jdbc.update("UPDATE crw_emission SET state='MATERIALIZED' WHERE arrival_id=?", arrival);
         Files.delete(file);
         JobExecution rerun = jobOperator.start(crwJob, new JobParametersBuilder()
                 .addString("run.date", "2026-07-12", true)
@@ -98,5 +100,14 @@ class CrwJobTest {
         List<String> xml2 = Files.readAllLines(file);
         assertTrue(xml2.stream().anyMatch(l -> l.contains("<NbOfTxs>3</NbOfTxs>")),
                 "restart rebuilt from the immutable snapshot, not the drifted live selection");
+
+        // Cross-window duplicate suppression: state is VISIBLE now; a later window
+        // of the same run date must NOT re-emit the collection order.
+        Files.delete(file);
+        JobExecution later = jobOperator.start(crwJob, new JobParametersBuilder()
+                .addString("run.date", "2026-07-12", true)
+                .addString("window", "w3", true).toJobParameters());
+        assertEquals(BatchStatus.COMPLETED, later.getStatus());
+        assertTrue(Files.notExists(file), "VISIBLE emission re-sent by a later window");
     }
 }
