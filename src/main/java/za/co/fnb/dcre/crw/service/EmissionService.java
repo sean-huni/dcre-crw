@@ -1,10 +1,13 @@
 package za.co.fnb.dcre.crw.service;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import za.co.fnb.dcre.crw.data.model.CrwEmissionEntity;
 import za.co.fnb.dcre.crw.data.model.CrwEmissionMemberEntity;
 import za.co.fnb.dcre.crw.data.model.DueRow;
+import za.co.fnb.dcre.crw.data.model.FuturedRow;
 import za.co.fnb.dcre.crw.data.repo.CrwEmissionMemberRepo;
 import za.co.fnb.dcre.crw.data.repo.CrwEmissionRepo;
 import za.co.fnb.dcre.platform.files.StagedWrite;
@@ -28,6 +31,8 @@ import java.util.UUID;
 @Service
 public class EmissionService {
 
+    private static final Logger log = LoggerFactory.getLogger(EmissionService.class);
+
     private final CrwEmissionRepo emissions;
     private final CrwEmissionMemberRepo members;
     private final Pain008Writer painWriter;
@@ -44,6 +49,11 @@ public class EmissionService {
 
     /** @return number of pain.008 files emitted for the run date. */
     public int emitDue(LocalDate runDate) throws IOException {
+        // R-38 exclusion visibility: one WARN per futured (warehoused) transaction.
+        for (FuturedRow futured : emissions.findFutured(runDate)) {
+            log.warn("excluded stage=CRW arrival={} seq={} e2e={} reason=FUTURED_{}",
+                    futured.arrivalId(), futured.sequence(), futured.e2e(), futured.processDate());
+        }
         Map<UUID, List<DueRow>> byArrival = new LinkedHashMap<>();
         for (DueRow row : emissions.findDue(runDate)) {
             byArrival.computeIfAbsent(row.arrivalId(), k -> new java.util.ArrayList<>()).add(row);
@@ -58,8 +68,8 @@ public class EmissionService {
     }
 
     private boolean emitOne(UUID arrivalId, LocalDate runDate, List<DueRow> due) throws IOException {
-        String client = due.get(0).client();
-        String msgId = due.get(0).msgId();
+        String client = due.getFirst().client();
+        String msgId = due.getFirst().msgId();
         String fileName = client + "_" + msgId + "_PAIN008.xml";
 
         CrwEmissionEntity candidate = CrwEmissionEntity.planned(arrivalId, runDate, fileName);
@@ -69,6 +79,8 @@ public class EmissionService {
             // Already handed to Fintegrate by an earlier window of this run date:
             // a later window MUST NOT re-emit (duplicate collection order). Restart
             // rebuilds still happen below while the state is pre-VISIBLE.
+            // R-38: single file-level WARN (no per-tx identity at file scope).
+            log.warn("excluded stage=CRW arrival={} seq=-1 e2e=- reason=ALREADY_VISIBLE", arrivalId);
             return false;
         }
         if ("PLANNED".equals(emission.getState())) {

@@ -1,6 +1,12 @@
 package za.co.fnb.dcre.crw;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import org.junit.jupiter.api.Test;
+import org.slf4j.LoggerFactory;
+import za.co.fnb.dcre.crw.service.EmissionService;
 import org.springframework.batch.core.BatchStatus;
 import org.springframework.batch.core.job.Job;
 import org.springframework.batch.core.job.JobExecution;
@@ -77,10 +83,26 @@ class CrwJobTest {
         String msgId = "DCRERFCRW" + arrival.toString().substring(0, 6);
         seed(arrival, msgId, 6, "2026-07-12", "2026-07-20");
 
+        Logger emissionLogger = (Logger) LoggerFactory.getLogger(EmissionService.class);
+        ListAppender<ILoggingEvent> warns = new ListAppender<>();
+        warns.start();
+        emissionLogger.addAppender(warns);
+
         JobExecution run = jobOperator.start(crwJob, new JobParametersBuilder()
                 .addString("run.date", "2026-07-12", true)
                 .addString("window", "w1", true).toJobParameters());
         assertEquals(BatchStatus.COMPLETED, run.getStatus());
+
+        // R-38 exclusion visibility: one WARN per futured (scheduled-but-not-due) row.
+        List<String> futuredWarns = warns.list.stream()
+                .filter(e -> e.getLevel() == Level.WARN)
+                .map(ILoggingEvent::getFormattedMessage)
+                .filter(m -> m.contains("excluded stage=CRW") && m.contains("reason=FUTURED_2026-07-20"))
+                .toList();
+        assertEquals(3, futuredWarns.size(),
+                "one WARN per futured row (even sequences, R-38 exclusion visibility)");
+        assertEquals("excluded stage=CRW arrival=" + arrival + " seq=2 e2e=E2E" + msgId
+                + "2 reason=FUTURED_2026-07-20", futuredWarns.get(0), "uniform R-38 WARN shape");
 
         Path file = Path.of("build/test-exchange/fint-req", "FNBRF01_" + msgId + "_PAIN008.xml");
         List<String> xml = Files.readAllLines(file);
@@ -109,5 +131,14 @@ class CrwJobTest {
                 .addString("window", "w3", true).toJobParameters());
         assertEquals(BatchStatus.COMPLETED, later.getStatus());
         assertTrue(Files.notExists(file), "VISIBLE emission re-sent by a later window");
+
+        // R-38: the later-window skip is a single file-level WARN, seq=-1 e2e=-.
+        assertTrue(warns.list.stream()
+                        .filter(e -> e.getLevel() == Level.WARN)
+                        .map(ILoggingEvent::getFormattedMessage)
+                        .anyMatch(m -> m.equals("excluded stage=CRW arrival=" + arrival
+                                + " seq=-1 e2e=- reason=ALREADY_VISIBLE")),
+                "file-level ALREADY_VISIBLE WARN (R-38 exclusion visibility)");
+        emissionLogger.detachAppender(warns);
     }
 }

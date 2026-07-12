@@ -6,6 +6,7 @@ import org.springframework.data.repository.CrudRepository;
 import org.springframework.data.repository.query.Param;
 import za.co.fnb.dcre.crw.data.model.CrwEmissionEntity;
 import za.co.fnb.dcre.crw.data.model.DueRow;
+import za.co.fnb.dcre.crw.data.model.FuturedRow;
 
 import java.time.LocalDate;
 import java.util.List;
@@ -24,6 +25,17 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
             WHERE s.process_date = :runDate
             ORDER BY t.arrival_id, t.sequence""", rowMapperClass = DueRowMapper.class)
     List<DueRow> findDue(@Param("runDate") LocalDate runDate);
+
+    /** Scheduled-but-not-due rows warehoused past the run date (R-38 exclusion visibility). */
+    @Query(value = """
+            SELECT t.arrival_id, t.sequence, t.e2e, s.process_date
+            FROM cde_schedule s
+            JOIN validation_log v ON v.arrival_id = s.arrival_id AND v.sequence = s.sequence AND v.outcome = 'PASS'
+            JOIN tx_entry t ON t.arrival_id = s.arrival_id AND t.sequence = s.sequence
+            JOIN tx_header h ON h.arrival_id = s.arrival_id
+            WHERE s.process_date > :runDate
+            ORDER BY t.arrival_id, t.sequence""", rowMapperClass = FuturedRowMapper.class)
+    List<FuturedRow> findFutured(@Param("runDate") LocalDate runDate);
 
     /** Snapshot claim (R-24): first writer wins; a restart sees empty and reuses the existing snapshot. */
     @Modifying
