@@ -13,7 +13,8 @@ import org.testcontainers.utility.DockerImageName;
  * Liquibase-managed schema, scheduler disabled, files under build/test-exchange.
  */
 @CucumberContextConfiguration
-@SpringBootTest(properties = {"spring.batch.job.enabled=false", "dcre.exchange-root=build/test-exchange"})
+@SpringBootTest(properties = {"spring.batch.job.enabled=false", "dcre.exchange-root=build/test-exchange",
+        "DCRE_EXCHANGE_ROOT=build/test-exchange"})
 public class CucumberSpringConfig {
 
     static final CockroachContainer CRDB =

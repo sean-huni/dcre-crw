@@ -1,5 +1,8 @@
 # 12FactorApp: committed working dev defaults; env overrides. (yml-only rule, configuration.md p19)
 spring:
+  # SCRUM-42: shared per-client exchange layout (platform-batch autoconfigures ExchangeLayout from this).
+  config:
+    import: classpath:dcre-exchange-layout.yml
   threads:
     virtual:
       enabled: true

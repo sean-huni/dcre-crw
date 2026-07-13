@@ -2,7 +2,6 @@ package za.co.fnb.dcre.crw.service;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import za.co.fnb.dcre.crw.data.model.CrwEmissionEntity;
 import za.co.fnb.dcre.crw.data.model.CrwEmissionMemberEntity;
@@ -10,11 +9,13 @@ import za.co.fnb.dcre.crw.data.model.DueRow;
 import za.co.fnb.dcre.crw.data.model.FuturedRow;
 import za.co.fnb.dcre.crw.data.repo.CrwEmissionMemberRepo;
 import za.co.fnb.dcre.crw.data.repo.CrwEmissionRepo;
+import za.co.fnb.dcre.platform.files.ExchangeChannel;
+import za.co.fnb.dcre.platform.files.ExchangeLayout;
+import za.co.fnb.dcre.platform.files.ExchangeSub;
 import za.co.fnb.dcre.platform.files.StagedWrite;
 
 import java.io.IOException;
 import java.math.BigDecimal;
-import java.nio.file.Path;
 import java.time.LocalDate;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -36,15 +37,14 @@ public class EmissionService {
     private final CrwEmissionRepo emissions;
     private final CrwEmissionMemberRepo members;
     private final Pain008Writer painWriter;
-    private final String exchangeRoot;
+    private final ExchangeLayout layout;
 
     public EmissionService(CrwEmissionRepo emissions, CrwEmissionMemberRepo members,
-                           Pain008Writer painWriter,
-                           @Value("${dcre.exchange-root}") String exchangeRoot) {
+                           Pain008Writer painWriter, ExchangeLayout layout) {
         this.emissions = emissions;
         this.members = members;
         this.painWriter = painWriter;
-        this.exchangeRoot = exchangeRoot;
+        this.layout = layout;
     }
 
     /** @return number of pain.008 files emitted for the run date. */
@@ -95,7 +95,8 @@ public class EmissionService {
         BigDecimal controlSum = snapshot.stream().map(CrwEmissionMemberEntity::getAmount)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
         List<String> xml = painWriter.build(msgId, snapshot, controlSum);
-        StagedWrite.write(Path.of(exchangeRoot, "fint-req", fileName), xml);
+        // SCRUM-42: per-client fint-req/out leaf. An unconfigured client fails closed here (resolve throws).
+        StagedWrite.write(layout.resolve(client, ExchangeChannel.FINT_REQ, ExchangeSub.OUT).resolve(fileName), xml);
         emissions.transition(emission.getId(), "VISIBLE");
         return true;
     }
