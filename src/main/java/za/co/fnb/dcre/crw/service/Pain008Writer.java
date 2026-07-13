@@ -20,15 +20,13 @@ public class Pain008Writer {
         xml.add("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
         xml.add("<Document><!-- SYNTHETIC-CONTRACT pain.008 skeleton (A-9) -->");
         xml.add("  <CstmrDrctDbtInitn><GrpHdr>");
-        xml.add("    <MsgId>" + msgId + "</MsgId>");
-        xml.add("    <NbOfTxs>" + members.size() + "</NbOfTxs>");
-        xml.add("    <CtrlSum>" + controlSum + "</CtrlSum>");
+        xml.add("    <MsgId>%s</MsgId>".formatted(msgId));
+        xml.add("    <NbOfTxs>%d</NbOfTxs>".formatted(members.size()));
+        xml.add("    <CtrlSum>%s</CtrlSum>".formatted(controlSum));
         xml.add("  </GrpHdr><PmtInf>");
         xml.add("    <PmtTpInf><LclInstrm><Cd>TT2</Cd></LclInstrm></PmtTpInf>");
         for (CrwEmissionMemberEntity member : members) {
-            xml.add("    <DrctDbtTxInf><PmtId><EndToEndId>" + member.getE2e().strip()
-                    + "</EndToEndId></PmtId><InstdAmt Ccy=\"ZAR\">" + member.getAmount()
-                    + "</InstdAmt></DrctDbtTxInf>");
+            xml.add("    <DrctDbtTxInf><PmtId><EndToEndId>%s</EndToEndId></PmtId><InstdAmt Ccy=\"ZAR\">%s</InstdAmt></DrctDbtTxInf>".formatted(member.getE2e().strip(), member.getAmount()));
         }
         xml.add("  </PmtInf></CstmrDrctDbtInitn>");
         xml.add("</Document>");
