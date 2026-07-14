@@ -3,6 +3,9 @@ package za.co.fnb.dcre.crw.service;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
+import org.springframework.transaction.support.TransactionTemplate;
 import za.co.fnb.dcre.crw.data.model.CrwEmissionEntity;
 import za.co.fnb.dcre.crw.data.model.CrwEmissionMemberEntity;
 import za.co.fnb.dcre.crw.data.model.DueRow;
@@ -15,6 +18,7 @@ import za.co.fnb.dcre.platform.files.ExchangeSub;
 import za.co.fnb.dcre.platform.files.StagedWrite;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.LinkedHashMap;
@@ -38,17 +42,33 @@ public class EmissionService {
     private final CrwEmissionMemberRepo members;
     private final Pain008Writer painWriter;
     private final ExchangeLayout layout;
+    private final TransactionTemplate arrivalTx;
 
-    public EmissionService(CrwEmissionRepo emissions, CrwEmissionMemberRepo members,
-                           Pain008Writer painWriter, ExchangeLayout layout) {
+    public EmissionService(final CrwEmissionRepo emissions, final CrwEmissionMemberRepo members,
+                           final Pain008Writer painWriter, final ExchangeLayout layout,
+                           final PlatformTransactionManager txManager) {
         this.emissions = emissions;
         this.members = members;
         this.painWriter = painWriter;
         this.layout = layout;
+        // SCRUM-42 load fix: each arrival commits in its OWN transaction so a
+        // 300k-tx window ratchets progress arrival by arrival; and a CRDB 40001
+        // abort poisons the surrounding transaction (25P02 on any further
+        // statement), so a retry needs a fresh transaction per attempt.
+        this.arrivalTx = new TransactionTemplate(txManager);
+        this.arrivalTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
     }
 
-    /** @return number of pain.008 files emitted for the run date. */
-    public int emitDue(LocalDate runDate) throws IOException {
+    /**
+     * Reads (futured WARN scan + due selection) stay in the caller's step
+     * transaction; every arrival then commits in its own REQUIRES_NEW
+     * transaction so one failure never rolls back sibling emissions. A failed
+     * arrival is logged and skipped; the window still reports FAILED at the
+     * end (the next window re-picks exactly the unclaimed arrivals).
+     *
+     * @return number of pain.008 files emitted for the run date.
+     */
+    public int emitDue(final LocalDate runDate) {
         // R-38 exclusion visibility: one WARN per futured (warehoused) transaction.
         for (FuturedRow futured : emissions.findFutured(runDate)) {
             log.warn("excluded stage=CRW arrival={} seq={} e2e={} reason=FUTURED_{}",
@@ -59,12 +79,34 @@ public class EmissionService {
             byArrival.computeIfAbsent(row.arrivalId(), k -> new java.util.ArrayList<>()).add(row);
         }
         int emitted = 0;
+        int failed = 0;
         for (var entry : byArrival.entrySet()) {
-            if (emitOne(entry.getKey(), runDate, entry.getValue())) {
-                emitted++;
+            try {
+                if (emitArrival(entry.getKey(), runDate, entry.getValue())) {
+                    emitted++;
+                }
+            } catch (final RuntimeException e) {
+                failed++;
+                log.error("emission failed stage=CRW arrival={} runDate={}", entry.getKey(), runDate, e);
             }
         }
+        if (failed > 0) {
+            throw new IllegalStateException("%d of %d due arrivals failed emission for run date %s"
+                    .formatted(failed, byArrival.size(), runDate));
+        }
         return emitted;
+    }
+
+    /** One arrival = one committed unit: fresh REQUIRES_NEW tx per bounded-retry attempt. */
+    private boolean emitArrival(final UUID arrivalId, final LocalDate runDate, final List<DueRow> due) {
+        return CrdbRetry.run("emit arrival=%s".formatted(arrivalId), () ->
+                Boolean.TRUE.equals(arrivalTx.execute(status -> {
+                    try {
+                        return emitOne(arrivalId, runDate, due);
+                    } catch (final IOException e) {
+                        throw new UncheckedIOException(e);
+                    }
+                })));
     }
 
     private boolean emitOne(UUID arrivalId, LocalDate runDate, List<DueRow> due) throws IOException {

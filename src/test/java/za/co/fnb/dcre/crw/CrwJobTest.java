@@ -145,6 +145,37 @@ class CrwJobTest {
     }
 
     @Test
+    void failedArrivalDoesNotRollBackCommittedSiblingEmissions() throws Exception {
+        UUID good = UUID.randomUUID();
+        UUID bad = UUID.randomUUID();
+        String goodMsg = "DCRERFCRW" + good.toString().substring(0, 6);
+        String badMsg = "DCRERFCRW" + bad.toString().substring(0, 6);
+        // Isolated run date keeps these arrivals out of the other tests' windows.
+        // FNBXX99 has no configured exchange dirs: its arrival fails closed.
+        seed(good, "FNBRF01", goodMsg, 1, "2026-03-02", "2026-03-09");
+        seed(bad, "FNBXX99", badMsg, 1, "2026-03-02", "2026-03-09");
+
+        JobExecution run = jobOperator.start(crwJob, new JobParametersBuilder()
+                .addString("run.date", "2026-03-02", true)
+                .addString("window", "wf", true).toJobParameters());
+
+        assertEquals(BatchStatus.FAILED, run.getStatus(),
+                "any failed arrival must keep the window outcome honest (job FAILED)");
+        // SCRUM-42 load fix: the good arrival's emission is COMMITTED in its own
+        // REQUIRES_NEW transaction despite the sibling failure (progress ratchets).
+        assertEquals("VISIBLE", jdbc.queryForObject(
+                        "SELECT state FROM crw_emission WHERE arrival_id = ?", String.class, good),
+                "sibling failure must not roll back the good arrival's committed emission");
+        Path file = Path.of("build/test-exchange/fnbrf01/fint-req/out", "FNBRF01_" + goodMsg + "_PAIN008.xml");
+        assertTrue(Files.readAllLines(file).stream().anyMatch(l -> l.contains("<NbOfTxs>1</NbOfTxs>")),
+                "good arrival's pain.008 written and handed over");
+        // The failed arrival left NO claim: the next window re-picks exactly it.
+        assertEquals(0, (int) jdbc.queryForObject(
+                        "SELECT count(*) FROM crw_emission WHERE arrival_id = ?", Integer.class, bad),
+                "failed arrival's claim rolled back so a later window re-picks it");
+    }
+
+    @Test
     void unconfiguredClientFailsClosed() throws Exception {
         UUID arrival = UUID.randomUUID();
         String msgId = "DCRERFCRW" + arrival.toString().substring(0, 6);
