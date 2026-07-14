@@ -8,7 +8,9 @@ import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 import za.co.fnb.dcre.crw.data.model.CrwEmissionEntity;
 import za.co.fnb.dcre.crw.data.model.CrwEmissionMemberEntity;
+import za.co.fnb.dcre.crw.data.model.DueArrivalRow;
 import za.co.fnb.dcre.crw.data.model.DueRow;
+import za.co.fnb.dcre.crw.data.model.FuturedCountRow;
 import za.co.fnb.dcre.crw.data.model.FuturedRow;
 import za.co.fnb.dcre.crw.data.repo.CrwEmissionMemberRepo;
 import za.co.fnb.dcre.crw.data.repo.CrwEmissionRepo;
@@ -21,9 +23,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.math.BigDecimal;
 import java.time.LocalDate;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -37,6 +37,9 @@ import java.util.UUID;
 public class EmissionService {
 
     private static final Logger log = LoggerFactory.getLogger(EmissionService.class);
+
+    /** Above this, a futured (arrival, process date) group logs ONE summary WARN instead of per-tx lines. */
+    static final long FUTURED_DETAIL_WARN_LIMIT = 100;
 
     private final CrwEmissionRepo emissions;
     private final CrwEmissionMemberRepo members;
@@ -60,58 +63,84 @@ public class EmissionService {
     }
 
     /**
-     * Reads (futured WARN scan + due selection) stay in the caller's step
-     * transaction; every arrival then commits in its own REQUIRES_NEW
-     * transaction so one failure never rolls back sibling emissions. A failed
-     * arrival is logged and skipped; the window still reports FAILED at the
-     * end (the next window re-picks exactly the unclaimed arrivals).
+     * Step-transaction reads are arrival-level scalars ONLY (futured count
+     * aggregates + due-arrival listing): the 23x300k whole-backlog per-tx
+     * join blew CRDB's sql memory budget (joinreader-mem) live. Every arrival
+     * then commits in its own REQUIRES_NEW transaction so one failure never
+     * rolls back sibling emissions. A failed arrival is logged and skipped;
+     * the window still reports FAILED at the end (the next window re-picks
+     * exactly the unclaimed arrivals).
      *
      * @return number of pain.008 files emitted for the run date.
      */
     public int emitDue(final LocalDate runDate) {
-        // R-38 exclusion visibility: one WARN per futured (warehoused) transaction.
-        for (FuturedRow futured : emissions.findFutured(runDate)) {
-            log.warn("excluded stage=CRW arrival={} seq={} e2e={} reason=FUTURED_{}",
-                    futured.arrivalId(), futured.sequence(), futured.e2e(), futured.processDate());
-        }
-        Map<UUID, List<DueRow>> byArrival = new LinkedHashMap<>();
-        for (DueRow row : emissions.findDue(runDate)) {
-            byArrival.computeIfAbsent(row.arrivalId(), k -> new java.util.ArrayList<>()).add(row);
-        }
+        warnFutured(runDate);
+        List<DueArrivalRow> arrivals = emissions.findDueArrivals(runDate);
         int emitted = 0;
         int failed = 0;
-        for (var entry : byArrival.entrySet()) {
+        for (DueArrivalRow arrival : arrivals) {
             try {
-                if (emitArrival(entry.getKey(), runDate, entry.getValue())) {
+                if (emitArrival(arrival, runDate)) {
                     emitted++;
                 }
             } catch (final RuntimeException e) {
                 failed++;
-                log.error("emission failed stage=CRW arrival={} runDate={}", entry.getKey(), runDate, e);
+                log.error("emission failed stage=CRW arrival={} runDate={}", arrival.arrivalId(), runDate, e);
             }
         }
         if (failed > 0) {
             throw new IllegalStateException("%d of %d due arrivals failed emission for run date %s"
-                    .formatted(failed, byArrival.size(), runDate));
+                    .formatted(failed, arrivals.size(), runDate));
         }
         return emitted;
     }
 
+    /**
+     * R-38 exclusion visibility without the whole-backlog per-tx fanout:
+     * aggregate counts per (arrival, process date) first; per-tx WARN detail
+     * only for small groups (uniform historic shape), ONE summary WARN with
+     * the count for large ones (300k per-tx lines are log spam AND the
+     * memory problem; seq=-1 e2e=- follows the ALREADY_VISIBLE file-level
+     * WARN precedent).
+     */
+    private void warnFutured(final LocalDate runDate) {
+        for (FuturedCountRow group : emissions.findFuturedCounts(runDate)) {
+            if (group.futured() > FUTURED_DETAIL_WARN_LIMIT) {
+                log.warn("excluded stage=CRW arrival={} seq=-1 e2e=- count={} reason=FUTURED_{}",
+                        group.arrivalId(), group.futured(), group.processDate());
+                continue;
+            }
+            for (FuturedRow futured : emissions.findFuturedForArrival(group.arrivalId(), group.processDate())) {
+                log.warn("excluded stage=CRW arrival={} seq={} e2e={} reason=FUTURED_{}",
+                        futured.arrivalId(), futured.sequence(), futured.e2e(), futured.processDate());
+            }
+        }
+    }
+
     /** One arrival = one committed unit: fresh REQUIRES_NEW tx per bounded-retry attempt. */
-    private boolean emitArrival(final UUID arrivalId, final LocalDate runDate, final List<DueRow> due) {
-        return CrdbRetry.run("emit arrival=%s".formatted(arrivalId), () ->
+    private boolean emitArrival(final DueArrivalRow arrival, final LocalDate runDate) {
+        return CrdbRetry.run("emit arrival=%s".formatted(arrival.arrivalId()), () ->
                 Boolean.TRUE.equals(arrivalTx.execute(status -> {
                     try {
-                        return emitOne(arrivalId, runDate, due);
+                        return emitOne(arrival, runDate);
                     } catch (final IOException e) {
                         throw new UncheckedIOException(e);
                     }
                 })));
     }
 
-    private boolean emitOne(UUID arrivalId, LocalDate runDate, List<DueRow> due) throws IOException {
-        String client = due.getFirst().client();
-        String msgId = due.getFirst().msgId();
+    private boolean emitOne(final DueArrivalRow arrival, final LocalDate runDate) throws IOException {
+        UUID arrivalId = arrival.arrivalId();
+        // This arrival's due rows, read INSIDE its own transaction: bounded by
+        // one arrival's size (300k max) instead of the whole backlog.
+        List<DueRow> due = emissions.findDueForArrival(runDate, arrivalId);
+        if (due.isEmpty()) {
+            // Every due row failed validation (or drifted away): nothing to
+            // emit, no claim taken, a later window re-evaluates this arrival.
+            return false;
+        }
+        String client = arrival.client();
+        String msgId = arrival.msgId();
         String fileName = client + "_" + msgId + "_PAIN008.xml";
 
         CrwEmissionEntity candidate = CrwEmissionEntity.planned(arrivalId, runDate, fileName);

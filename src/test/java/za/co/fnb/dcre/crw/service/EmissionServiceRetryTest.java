@@ -7,6 +7,7 @@ import org.springframework.batch.infrastructure.support.transaction.Resourceless
 import org.springframework.dao.CannotAcquireLockException;
 import za.co.fnb.dcre.crw.data.model.CrwEmissionEntity;
 import za.co.fnb.dcre.crw.data.model.CrwEmissionMemberEntity;
+import za.co.fnb.dcre.crw.data.model.DueArrivalRow;
 import za.co.fnb.dcre.crw.data.model.DueRow;
 import za.co.fnb.dcre.crw.data.repo.CrwEmissionMemberRepo;
 import za.co.fnb.dcre.crw.data.repo.CrwEmissionRepo;
@@ -64,12 +65,15 @@ class EmissionServiceRetryTest {
                 Map.of(ExchangeChannel.FINT_REQ, Map.of(ExchangeSub.OUT, "fnbrf01/fint-req/out"))));
         service = new EmissionService(emissions, members, new Pain008Writer(), layout,
                 new ResourcelessTransactionManager());
-        when(emissions.findFutured(RUN_DATE)).thenReturn(List.of());
+        when(emissions.findFuturedCounts(RUN_DATE)).thenReturn(List.of());
     }
 
     @Test
     void transientAbortOnOneArrivalRetriesInFreshTransactionThenEmits() throws Exception {
-        when(emissions.findDue(RUN_DATE)).thenReturn(List.of(due(GOOD_ARRIVAL, "FNBRF01", "MSGA")));
+        when(emissions.findDueArrivals(RUN_DATE)).thenReturn(List.of(
+                new DueArrivalRow(GOOD_ARRIVAL, "FNBRF01", "MSGA")));
+        when(emissions.findDueForArrival(RUN_DATE, GOOD_ARRIVAL)).thenReturn(List.of(
+                due(GOOD_ARRIVAL, "FNBRF01", "MSGA")));
         final CrwEmissionEntity emission = stubEmission(GOOD_ARRIVAL, "FNBRF01_MSGA_PAIN008.xml");
         doThrow(ABORT).doThrow(ABORT).doNothing().when(emissions).claimSnapshot(any());
         when(members.findByEmissionIdOrderBySequence(emission.getId())).thenReturn(List.of(
@@ -86,8 +90,12 @@ class EmissionServiceRetryTest {
     @Test
     void failedArrivalIsSkippedSurvivorsEmitAndTheWindowReportsFailure() {
         // The failing arrival comes FIRST: the loop must carry on past it.
-        when(emissions.findDue(RUN_DATE)).thenReturn(List.of(
-                due(BAD_ARRIVAL, "FNBXX99", "MSGB"),
+        when(emissions.findDueArrivals(RUN_DATE)).thenReturn(List.of(
+                new DueArrivalRow(BAD_ARRIVAL, "FNBXX99", "MSGB"),
+                new DueArrivalRow(GOOD_ARRIVAL, "FNBRF01", "MSGA")));
+        when(emissions.findDueForArrival(RUN_DATE, BAD_ARRIVAL)).thenReturn(List.of(
+                due(BAD_ARRIVAL, "FNBXX99", "MSGB")));
+        when(emissions.findDueForArrival(RUN_DATE, GOOD_ARRIVAL)).thenReturn(List.of(
                 due(GOOD_ARRIVAL, "FNBRF01", "MSGA")));
         stubEmission(BAD_ARRIVAL, "FNBXX99_MSGB_PAIN008.xml");
         final CrwEmissionEntity good = stubEmission(GOOD_ARRIVAL, "FNBRF01_MSGA_PAIN008.xml");
