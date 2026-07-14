@@ -28,7 +28,8 @@ import java.util.UUID;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-@SpringBootTest(properties = {"spring.batch.job.enabled=false", "dcre.exchange-root=build/test-exchange"})
+@SpringBootTest(properties = {"spring.batch.job.enabled=false", "dcre.exchange-root=build/test-exchange",
+        "DCRE_EXCHANGE_ROOT=build/test-exchange"})
 class CrwJobTest {
 
     static final CockroachContainer CRDB =
@@ -54,7 +55,7 @@ class CrwJobTest {
     @Autowired
     JdbcTemplate jdbc;
 
-    void seed(UUID arrival, String msgId, int total, String dueDate, String futureDate) {
+    void seed(UUID arrival, String client, String msgId, int total, String dueDate, String futureDate) {
         jdbc.execute("CREATE TABLE IF NOT EXISTS tx_header (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
                 + " arrival_id UUID UNIQUE, msg_id VARCHAR(35), initg_pty VARCHAR(35))");
         jdbc.execute("CREATE TABLE IF NOT EXISTS tx_entry (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
@@ -64,7 +65,7 @@ class CrwJobTest {
         jdbc.execute("CREATE TABLE IF NOT EXISTS cde_schedule (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
                 + " arrival_id UUID, sequence INT, process_date DATE, UNIQUE (arrival_id, sequence))");
         jdbc.update("UPSERT INTO tx_header (arrival_id, msg_id, initg_pty) VALUES (?,?,?)",
-                arrival, msgId, "FNBRF01");
+                arrival, msgId, client);
         for (int i = 1; i <= total; i++) {
             jdbc.update("INSERT INTO tx_entry (arrival_id, sequence, e2e, amount) VALUES (?,?,?,?)"
                     + " ON CONFLICT (arrival_id, sequence) DO NOTHING", arrival, i, "E2E" + msgId + i, i * 10.0);
@@ -81,7 +82,7 @@ class CrwJobTest {
     void emitsOnlyRowsDueTodayAndSnapshotIsImmutable() throws Exception {
         UUID arrival = UUID.randomUUID();
         String msgId = "DCRERFCRW" + arrival.toString().substring(0, 6);
-        seed(arrival, msgId, 6, "2026-07-12", "2026-07-20");
+        seed(arrival, "FNBRF01", msgId, 6, "2026-07-12", "2026-07-20");
 
         Logger emissionLogger = (Logger) LoggerFactory.getLogger(EmissionService.class);
         ListAppender<ILoggingEvent> warns = new ListAppender<>();
@@ -104,7 +105,8 @@ class CrwJobTest {
         assertEquals("excluded stage=CRW arrival=" + arrival + " seq=2 e2e=E2E" + msgId
                 + "2 reason=FUTURED_2026-07-20", futuredWarns.get(0), "uniform R-38 WARN shape");
 
-        Path file = Path.of("build/test-exchange/fint-req", "FNBRF01_" + msgId + "_PAIN008.xml");
+        // SCRUM-42: pain.008 now lands under the per-client fint-req/out leaf, not the flat channel dir.
+        Path file = Path.of("build/test-exchange/fnbrf01/fint-req/out", "FNBRF01_" + msgId + "_PAIN008.xml");
         List<String> xml = Files.readAllLines(file);
         assertEquals(1, xml.stream().filter(l -> l.contains("<NbOfTxs>3</NbOfTxs>")).count(),
                 "only the 3 odd (due-today) rows emitted; futured rows warehoused (R-37)");
@@ -140,5 +142,64 @@ class CrwJobTest {
                                 + " seq=-1 e2e=- reason=ALREADY_VISIBLE")),
                 "file-level ALREADY_VISIBLE WARN (R-38 exclusion visibility)");
         emissionLogger.detachAppender(warns);
+    }
+
+    @Test
+    void failedArrivalDoesNotRollBackCommittedSiblingEmissions() throws Exception {
+        UUID good = UUID.randomUUID();
+        UUID bad = UUID.randomUUID();
+        String goodMsg = "DCRERFCRW" + good.toString().substring(0, 6);
+        String badMsg = "DCRERFCRW" + bad.toString().substring(0, 6);
+        // Isolated run date keeps these arrivals out of the other tests' windows.
+        // FNBXX99 has no configured exchange dirs: its arrival fails closed.
+        seed(good, "FNBRF01", goodMsg, 1, "2026-03-02", "2026-03-09");
+        seed(bad, "FNBXX99", badMsg, 1, "2026-03-02", "2026-03-09");
+
+        JobExecution run = jobOperator.start(crwJob, new JobParametersBuilder()
+                .addString("run.date", "2026-03-02", true)
+                .addString("window", "wf", true).toJobParameters());
+
+        assertEquals(BatchStatus.FAILED, run.getStatus(),
+                "any failed arrival must keep the window outcome honest (job FAILED)");
+        // SCRUM-42 load fix: the good arrival's emission is COMMITTED in its own
+        // REQUIRES_NEW transaction despite the sibling failure (progress ratchets).
+        assertEquals("VISIBLE", jdbc.queryForObject(
+                        "SELECT state FROM crw_emission WHERE arrival_id = ?", String.class, good),
+                "sibling failure must not roll back the good arrival's committed emission");
+        Path file = Path.of("build/test-exchange/fnbrf01/fint-req/out", "FNBRF01_" + goodMsg + "_PAIN008.xml");
+        assertTrue(Files.readAllLines(file).stream().anyMatch(l -> l.contains("<NbOfTxs>1</NbOfTxs>")),
+                "good arrival's pain.008 written and handed over");
+        // The failed arrival left NO claim: the next window re-picks exactly it.
+        assertEquals(0, (int) jdbc.queryForObject(
+                        "SELECT count(*) FROM crw_emission WHERE arrival_id = ?", Integer.class, bad),
+                "failed arrival's claim rolled back so a later window re-picks it");
+    }
+
+    @Test
+    void unconfiguredClientFailsClosed() throws Exception {
+        UUID arrival = UUID.randomUUID();
+        String msgId = "DCRERFCRW" + arrival.toString().substring(0, 6);
+        // FNBXX99 has no configured exchange dirs. An isolated past run date (2026-01-01)
+        // keeps this arrival out of the other test's findDue/findFutured windows.
+        seed(arrival, "FNBXX99", msgId, 1, "2026-01-01", "2026-01-08");
+
+        JobExecution run = jobOperator.start(crwJob, new JobParametersBuilder()
+                .addString("run.date", "2026-01-01", true)
+                .addString("window", "wx", true).toJobParameters());
+
+        assertEquals(BatchStatus.FAILED, run.getStatus(),
+                "an unconfigured client must fail closed via ExchangeLayout.resolve, never emit to a shared/wrong dir");
+        assertTrue(Files.notExists(Path.of("build/test-exchange/fint-req", "FNBXX99_" + msgId + "_PAIN008.xml")),
+                "no flat-dir fallback write for an unconfigured client");
+        // SCRUM-42: nor may it land under the per-client fint-req/out leaf the new code actually writes to.
+        Path perClientDir = Path.of("build/test-exchange/fnbxx99/fint-req/out");
+        assertTrue(Files.notExists(perClientDir.resolve("FNBXX99_" + msgId + "_PAIN008.xml")),
+                "no per-client write for an unconfigured client (SCRUM-42)");
+        if (Files.exists(perClientDir)) {
+            try (var staged = Files.list(perClientDir)) {
+                assertTrue(staged.noneMatch(p -> p.getFileName().toString().contains(msgId)),
+                        "no per-client PAIN008 staged for an unconfigured client");
+            }
+        }
     }
 }

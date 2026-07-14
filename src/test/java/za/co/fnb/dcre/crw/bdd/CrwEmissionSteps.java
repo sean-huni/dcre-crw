@@ -80,7 +80,8 @@ public class CrwEmissionSteps {
         windowSalt = arrival.toString().substring(0, 8);
         msgId = "DCRERFCRW" + arrival.toString().substring(0, 6);
         dueCount = due;
-        painFile = Path.of("build/test-exchange/fint-req", "FNBRF01_" + msgId + "_PAIN008.xml");
+        // SCRUM-42: per-client fint-req/out leaf (client FNBRF01 -> base fnbrf01).
+        painFile = Path.of("build/test-exchange/fnbrf01/fint-req/out", "FNBRF01_" + msgId + "_PAIN008.xml");
         jdbc.update("UPSERT INTO tx_header (arrival_id, msg_id, initg_pty) VALUES (?,?,?)",
                 arrival, msgId, "FNBRF01");
         for (int i = 1; i <= due + futured; i++) {

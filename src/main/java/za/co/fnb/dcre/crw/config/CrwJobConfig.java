@@ -15,6 +15,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.core.annotation.Order;
 import org.springframework.transaction.PlatformTransactionManager;
 import za.co.fnb.dcre.crw.service.EmissionTasklet;
+import za.co.fnb.dcre.platform.batch.CrdbRetryExceptionHandler;
 import za.co.fnb.dcre.platform.batch.OutcomeFileWriter;
 import za.co.fnb.dcre.platform.batch.StaleExecutionSweeper;
 
@@ -27,7 +28,12 @@ public class CrwJobConfig {
     @Bean
     public Job crwJob(JobRepository repo, PlatformTransactionManager tx, EmissionTasklet tasklet,
                       @Value("${dcre.exchange-root}") String exchangeRoot) {
-        Step emitStep = new StepBuilder("emitStep", repo).tasklet(tasklet, tx).build();
+        // CRDB 40001 aborts hit the tasklet's commit boundary under contention; the shared
+        // platform handler re-runs the WHOLE tasklet in a fresh tx, which is safe here by
+        // design: claim-once snapshot (R-24), member ON CONFLICT no-ops, StagedWrite
+        // restart no-op (R-05) and the VISIBLE guard. Retry, never skip.
+        Step emitStep = new StepBuilder("emitStep", repo).tasklet(tasklet, tx)
+                .exceptionHandler(new CrdbRetryExceptionHandler("CRW")).build();
         return new JobBuilder("crwJob", repo)
                 .listener(new SeamListener(exchangeRoot))
                 .start(emitStep)
