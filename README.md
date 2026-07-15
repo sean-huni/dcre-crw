@@ -1,69 +1,92 @@
 # dcre-crw
 
-Collection Request Writer = Process-Date Executor (R-37): clock/PC-window job emitting pain.008 ONLY for transactions where run date == `cde_schedule.process_date`; futured work warehouses. Snapshot-first (R-24): membership claimed immutably before file build; restart reuses it. 3-tier; SYNTHETIC pain.008 skeleton (A-9); TT2 via LclInstrm/Cd (R-02/R-18).
+Collections Request Writer: the clock-windowed DCRE stage that emits pain.008 collection-order files (per-client `fint-req/out`) for validated work due on the run date.
 
-## Pipeline position
+## What it does
 
-Terminal Collections-DAG stage downstream of CDE (`CDE -> CRW`), causally independent of the parallel CIR branch. Unlike CTV/CDE it is not launched per arrival: AGT launches it on the clock/PC window with job identity (run date, window) per R-16/R-37. Boundary service (R-30): the only file it touches is the outbound Fintegrate XML; everything else transitions via the DB.
+CRW is the Process-Date Executor (R-37), the terminal Collections-DAG stage downstream of CDE. Unlike the per-arrival stages, AGT launches it as a short-lived Kubernetes Job on the clock/PC window with identifying job parameters `(run.date, window)` per R-16/R-37. It selects PASS-validated transactions whose `cde_schedule.process_date` equals the run date, freezes membership into an immutable snapshot, and writes one synthetic pain.008 XML per arrival into that client's `fint-req/out` exchange directory for Fintegrate; futured (scheduled-but-not-due) work stays warehoused, visible via R-38 exclusion WARNs.
 
-## Job structure and key rules
+## Architecture and principles
 
-`crwJob` = single tasklet step `emitStep`: `EmissionTasklet` (thin entry adapter) -> `EmissionService` (business tier) -> `data/repo` + `Pain008Writer`. Identifying JobParameters: `run.date` (ISO date) and `window`. The count of emitted files lands in the execution context as `emitted`.
+- SOLID, 3-tier, layer-first packages: the Batch tasklet (`EmissionTasklet`) is a thin entry adapter that calls one business-tier method; all logic lives in `service/EmissionService`; persistence only via `data/repo` (`CrwEmissionRepo`, `CrwEmissionMemberRepo`) with entities in `data/model` extending the platform `BaseEntity`. Single responsibility per class: `Pain008Writer` builds XML, `CrdbRetry` bounds retries, `SeamListener` owns the outcome seam.
+- 12FactorApp Alignment - https://12factor.net/ : config strictly from the environment with committed working dev defaults (a clean clone runs with no `.env`), a stateless one-shot process, CockroachDB and the exchange filesystem as attached backing services.
+- Idempotent restart semantics, snapshot-first (R-24): per (arrival, run date) the emission is claimed via `INSERT ... ON CONFLICT (arrival_id, run_date) DO NOTHING` (first writer wins), then walks `PLANNED -> MATERIALIZED -> VISIBLE`. Members freeze into `crw_emission_member` while PLANNED; the file is built strictly from that immutable snapshot, never the live selection, so a restart rebuilds the identical member set even after the schedule drifts. `StagedWrite` (tmp + atomic move) makes the file write a restart no-op (R-05). A VISIBLE emission was already handed to Fintegrate: a later window of the same run date never re-emits (single file-level WARN `reason=ALREADY_VISIBLE`, SCRUM-30).
+- CRDB serialization aborts (SQLSTATE 40001) are retried, never skipped: each arrival commits in its own `REQUIRES_NEW` transaction wrapped in `CrdbRetry` (5 attempts, exponential backoff), and the production `emitStep` carries the shared platform `CrdbRetryExceptionHandler` at the step boundary. One failed arrival never rolls back sibling emissions; the window still fails at the end so the next window re-picks exactly the unclaimed arrivals (SCRUM-42 load fix, per-arrival reads instead of the whole-backlog join that blew CRDB's sql memory budget).
 
-Per run date, `EmissionService.emitDue`:
+### Job structure
 
-1. R-38 exclusion visibility: one WARN per futured (scheduled-but-not-due) transaction, shape `excluded stage=CRW arrival=<id> seq=<n> e2e=<e2e> reason=FUTURED_<process_date>`.
-2. Selects due rows (PASS verdict + `process_date = run date`, joined across `cde_schedule`/`validation_log`/`tx_entry`/`tx_header`), grouped per arrival.
-3. Per arrival, snapshot-first (R-24): claims `crw_emission` via `INSERT ... ON CONFLICT (arrival_id, run_date) DO NOTHING` (first writer wins), then walks the state machine `PLANNED -> MATERIALIZED -> VISIBLE`. Members are frozen into `crw_emission_member` while PLANNED; the file is built strictly from that immutable snapshot, never the live selection, so a restart rebuilds the identical member set even when the schedule has moved on.
-4. Cross-window duplicate suppression (SCRUM-30): a VISIBLE emission was already handed to Fintegrate by an earlier window of the same run date; a later window MUST NOT re-emit (duplicate collection order). Skip is a single file-level WARN `... seq=-1 e2e=- reason=ALREADY_VISIBLE`. Restart rebuilds still happen while the state is pre-VISIBLE.
-5. Writes `<exchange-root>/fint-req/<initg_pty>_<msg_id>_PAIN008.xml` via `StagedWrite` (atomic; restart no-op, R-05), then transitions to VISIBLE.
+`crwJob` = single tasklet step `emitStep`; the emitted-file count lands in the execution context as `emitted`. An `@Order(-10)` ApplicationRunner runs `StaleExecutionSweeper.abandonStale(ds, "CRW_BATCH_", 60)` before launch, abandoning STARTED executions older than 60 s so a killed pod cannot strand the relaunch (A-39a). `afterJob` on COMPLETED writes `BUSINESS_ACCEPTED` to `<exchange-root>/outcomes/<JOB_NAME>` (staged, atomic); technical death writes nothing: the R-34 exit code (`ExitCodeMain`) and the K8s condition are the witnesses (R-33).
 
-`Pain008Writer` is the [SYNTHETIC-CONTRACT R-35, A-9] pain.008-shaped skeleton: GrpHdr MsgId/NbOfTxs/CtrlSum (sum of member amounts), `PmtTpInf/LclInstrm/Cd = TT2` (R-02/R-18), one DrctDbtTxInf per member with the canonical EndToEndId byte-preserved (R-15) and `InstdAmt Ccy="ZAR"`. Real bindings become JAXB from the Fintegrate XSD profile when recovered.
+### Data
 
-## Outcome seam
+Reads (grants-based): `cde_schedule` (CDE), `validation_log` (CTV), `tx_entry` + `tx_header` (CRR). Writes (CRW single-writer): `crw_emission` (UNIQUE `(arrival_id, run_date)`), `crw_emission_member` (UNIQUE `(emission_id, sequence)`), plus the outbound `<initg_pty>_<msg_id>_PAIN008.xml`. Liquibase owns all DDL with per-service history tables `crw_databasechangelog` / `crw_databasechangeloglock` on the shared DB; Spring Batch metadata sits under the `CRW_BATCH_` prefix with `initialize-schema: never`.
 
-`afterJob` on COMPLETED writes `BUSINESS_ACCEPTED` to `<exchange-root>/outcomes/<JOB_NAME>` (staged, atomic). Technical death writes nothing: the R-34 exit code (`ExitCodeMain`) and the K8s condition are the witnesses; AGT treats absence as never-success (R-33).
+`Pain008Writer` is the SYNTHETIC-CONTRACT (R-35, A-9) pain.008-shaped skeleton: GrpHdr `MsgId`/`NbOfTxs`/`CtrlSum` (sum of member amounts), `PmtTpInf/LclInstrm/Cd = TT2` (R-02/R-18), one `DrctDbtTxInf` per member with the canonical EndToEndId (R-15) and `InstdAmt Ccy="ZAR"`. Real bindings become JAXB from the Fintegrate XSD profile when recovered.
 
-## Data
+## Prerequisites
 
-Reads (grants-based, R-04/R-06): `cde_schedule` (CDE), `validation_log` (CTV), `tx_entry` + `tx_header` (CRR). Writes: `crw_emission` (UNIQUE(arrival_id, run_date)) and `crw_emission_member` (UNIQUE(emission_id, sequence)), both CRW single-writer (R-04), plus the outbound pain.008 file.
+- Java 25 (Gradle toolchain; wrapper 9.5.1 included)
+- Docker (Testcontainers test suite and image build)
+- Platform libs in Maven Local: `za.co.fnb.dcre:platform-persistence:0.1.0` and `za.co.fnb.dcre:platform-batch:0.1.0` (`platform-batch` brings `platform-files` and `platform-model` transitively; all resolve from `mavenLocal` only)
+- A reachable CockroachDB for a real run (the dcre-infra kind cluster, or any CRDB at `DCRE_DB_URL`)
 
-Liquibase: per-service history tables `crw_databasechangelog` / `crw_databasechangeloglock` (shared DB). Changesets: 001 `crw_emission` + `crw_emission_member` (immutable emission snapshot, R-24), 002 CRW_BATCH_ metadata DDL.
+## Quickstart
 
-## Batch metadata
+```bash
+# one-time: publish the platform libs (order matters for the batch chain)
+(cd ../platform-model && ./gradlew publishToMavenLocal)
+(cd ../platform-files && ./gradlew publishToMavenLocal)
+(cd ../platform-batch && ./gradlew publishToMavenLocal)
+(cd ../platform-persistence && ./gradlew publishToMavenLocal)
 
-Spring Batch tables under the `CRW_BATCH_` prefix, `initialize-schema: never` (Liquibase owns the DDL). A-39a self-abandonment: an `@Order(-10)` ApplicationRunner runs `StaleExecutionSweeper.abandonStale(ds, "CRW_BATCH_", 60)` before the job launches, abandoning STARTED executions older than 60 s so a killed pod cannot strand the relaunch.
+./gradlew build        # compile + full test suite (Docker required)
+```
 
-## Local module dependencies
+Local one-shot run against the kind cluster's CRDB (dcre-infra `scripts/crdb-forward.sh` forwards host 26258 to cluster 26257):
 
-| Module | Version | Scope | Used for |
-|---|---|---|---|
-| `dcre-platform-persistence` | 0.1.0 | `implementation` | `BaseEntity` (version/created_at/updated_at on `CrwEmissionEntity`/`CrwEmissionMemberEntity`), `JdbcConfig` (Spring Data JDBC base config, imported by `CrwApplication`) |
-| `dcre-platform-batch` | 0.1.0 | `implementation` | `ExitCodeMain` (R-34 exit-code wiring), `OutcomeFileWriter` (outcome seam), `StaleExecutionSweeper` (A-39a self-abandonment) |
+```bash
+DCRE_DB_URL="jdbc:postgresql://localhost:26258/dcre_collections?sslmode=disable" \
+  java -jar build/libs/crw-2.0.jar run.date=2026-07-15 window=w1
+```
 
-`StagedWrite` (the atomic pain.008 write) comes from `dcre-platform-files`, not declared directly: it arrives transitively via `dcre-platform-batch`'s `api` chain (batch brings files brings model). All artifacts resolve from Maven Local only (no remote repository): run `./gradlew publishToMavenLocal` in each dependency repo first, publish chain `dcre-platform-model` -> `dcre-platform-files` -> `dcre-platform-batch`; `dcre-platform-persistence` is standalone. Details in each module repo's README under "Publishing".
+The JVM exit code carries the Batch verdict (R-34). A clean clone runs with NO `.env`: `application.yml` commits working dev defaults.
 
 ## Configuration
 
-12FactorApp Alignment (https://12factor.net/): committed working dev defaults, env overrides; a clean clone runs with no `.env`.
-
-| Env var | Default | Used for |
+| Env var | Default | Purpose |
 |---|---|---|
-| `DCRE_DB_URL` | `jdbc:postgresql://localhost:26257/dcre_collections?sslmode=disable` | shared CockroachDB |
-| `DCRE_DB_USER` / `DCRE_DB_PASSWORD` | `root` / empty | DB credentials |
-| `DCRE_EXCHANGE_ROOT` | `../../infra/dcre-infra/exchange` | `fint-req/` output + outcome seam |
-| `JOB_NAME` | `local-<executionId>` | outcome seam file name (set by AGT) |
+| `DCRE_DB_URL` | `jdbc:postgresql://localhost:26257/dcre_collections?sslmode=disable` | shared CockroachDB JDBC URL |
+| `DCRE_DB_USER` | `root` | DB user |
+| `DCRE_DB_PASSWORD` | (empty) | DB password |
+| `DCRE_EXCHANGE_ROOT` | `../../../../../infra/dcre-infra/exchange` | exchange tree root: per-client `fint-req/out` output + `outcomes/` seam |
+| `JOB_NAME` | `local-<executionId>` | outcome seam file name; set by AGT on minted Jobs |
 
-`DCRE_AMOUNT_SCALE`, `DCRE_V1_ENABLED` and `DCRE_FLOW_DC` sit in the shared config block but are not consumed by CRW code.
+`spring.config.import: classpath:dcre-exchange-layout.yml` (shipped in `platform-batch`, SCRUM-42) maps the per-client exchange leaves (FNBCC01, FNBCC02, FNBRF01); an unconfigured client fails closed at `ExchangeLayout.resolve`. `DCRE_AMOUNT_SCALE`, `DCRE_V1_ENABLED` and `DCRE_FLOW_DC` sit in the shared `dcre` config block but are not consumed by CRW code.
 
-## Build & test
+## Testing
 
-Spring Boot 4.1.0, Java 25 toolchain; platform libs resolve from mavenLocal (see Local module dependencies). `./gradlew test` (Docker required): `CrwJobTest` on Testcontainers CockroachDB v26.2.3 covers the whole contract in one scenario: only due-today rows emitted (futured rows warehoused with one R-38 WARN each), TT2 present, snapshot immutability (schedule drifts + pre-VISIBLE crash state + deleted file -> rerun rebuilds the identical members), and cross-window suppression (later window of the same run date re-emits nothing, single ALREADY_VISIBLE WARN).
+```bash
+./gradlew test   # Docker required
+```
 
-## Run
+- `CrwJobTest`: end-to-end job contract on Testcontainers CockroachDB `v26.2.3`.
+- `CucumberSuiteTest` (BDD, `features/crw-process-date-executor.feature`): due-only emission with TT2, futured warehousing with per-tx R-38 WARNs, snapshot restart rebuilding the identical member set, ALREADY_VISIBLE cross-window suppression, and idempotent same-window rerun.
+- `EmissionServiceFuturedWarnTest`: R-38 WARN shape at 300k scale (per-tx detail up to 100 per group, one summary WARN above).
+- `EmissionServiceRetryTest` / `CrwJobConfigRetryTest`: bounded CRDB 40001 retry at the service and step boundary.
 
-`./gradlew build && docker build -t dcre-crw:0.1.0 .` (eclipse-temurin:25-jre-alpine). In the cluster AGT launches it as a Job on the PC window with `JOB_NAME` and the identifying `run.date=<yyyy-MM-dd> window=<id>` job parameters; locally: `java -jar build/libs/dcre-crw-0.1.0.jar run.date=2026-07-12 window=w1` against the dcre-infra compose stack. The JVM exit code carries the Batch outcome (R-34).
+## Local cluster deployment
 
-## Observability
+```bash
+./gradlew bootJar
+docker build -t dcre-crw:2.1.1 .
+kind load docker-image --name dcre-dev dcre-crw:2.1.1
+```
 
-No metrics wired yet. Operational signals: structured R-38 exclusion WARNs (`excluded stage=CRW ... reason=FUTURED_*` / `reason=ALREADY_VISIBLE`), the outcome seam file, and the R-34 exit code observed by AGT.
+The Dockerfile (`eclipse-temurin:25-jre-alpine`) packages `build/libs/crw-2.0.jar` (the Gradle project version; the fleet release version is carried by the image and git tag, digits-only SemVer, no `v` prefix). In the cluster, AGT mints CRW as a short-lived Kubernetes Job on the PC window: the image comes from AGT's `AGT_CRW_IMAGE` env (set fleet-wide by dcre-infra `scripts/switch-version.sh`), with `JOB_NAME` and the identifying parameters `run.date=<yyyy-MM-dd> window=<id>`.
+
+## Related repositories
+
+- Orchestrator: [dcre-agt](https://github.com/sean-huni/dcre-agt)
+- Stage services: [dcre-crr](https://github.com/sean-huni/dcre-crr), [dcre-ctv](https://github.com/sean-huni/dcre-ctv), [dcre-cde](https://github.com/sean-huni/dcre-cde), [dcre-cir](https://github.com/sean-huni/dcre-cir), [dcre-ixr](https://github.com/sean-huni/dcre-ixr), [dcre-sxr](https://github.com/sean-huni/dcre-sxr), [dcre-pxr](https://github.com/sean-huni/dcre-pxr), [dcre-prg](https://github.com/sean-huni/dcre-prg), [dcre-ais](https://github.com/sean-huni/dcre-ais), [dcre-hcs](https://github.com/sean-huni/dcre-hcs)
+- Platform libs: [dcre-platform-model](https://github.com/sean-huni/dcre-platform-model), [dcre-platform-files](https://github.com/sean-huni/dcre-platform-files), [dcre-platform-batch](https://github.com/sean-huni/dcre-platform-batch), [dcre-platform-persistence](https://github.com/sean-huni/dcre-platform-persistence)
+- Environment and tooling: [dcre-infra](https://github.com/sean-huni/dcre-infra), [dcre-fixture-toolkit](https://github.com/sean-huni/dcre-fixture-toolkit), [dcre-design-register](https://github.com/sean-huni/dcre-design-register), [dcre-rpt](https://github.com/sean-huni/dcre-rpt)
