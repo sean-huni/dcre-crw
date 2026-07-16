@@ -57,7 +57,7 @@ class EmissionServiceFuturedWarnTest {
         final ExchangeLayout layout = new ExchangeLayout(root, Map.of("FNBRF01",
                 Map.of(ExchangeChannel.FINT_REQ, Map.of(ExchangeSub.OUT, "fnbrf01/fint-req/out"))));
         service = new EmissionService(emissions, mock(CrwEmissionMemberRepo.class), new Pain008Writer(),
-                layout, new ResourcelessTransactionManager());
+                layout, mock(SplitPlanner.class), new ResourcelessTransactionManager());
         when(emissions.findDueArrivals(RUN_DATE)).thenReturn(List.of());
         emissionLogger = (Logger) LoggerFactory.getLogger(EmissionService.class);
         warns = new ListAppender<>();

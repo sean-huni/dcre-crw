@@ -13,13 +13,6 @@ import java.util.UUID;
 
 public interface CrwEmissionMemberRepo extends CrudRepository<CrwEmissionMemberEntity, UUID> {
 
-    @Modifying
-    @Query("""
-            INSERT INTO crw_emission_member (emission_id, sequence, e2e, amount)
-            VALUES (:#{#e.emissionId}, :#{#e.sequence}, :#{#e.e2e}, :#{#e.amount})
-            ON CONFLICT (emission_id, sequence) DO NOTHING""")
-    void addMember(@Param("e") CrwEmissionMemberEntity e);
-
     /**
      * Set-based ordinal member claim (SCRUM-55): the [loSeq, hiSeq] slice of
      * the eligible rows is claimed in ONE statement inside the arrival

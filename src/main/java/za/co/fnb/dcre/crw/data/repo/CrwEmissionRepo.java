@@ -6,7 +6,6 @@ import org.springframework.data.repository.CrudRepository;
 import org.springframework.data.repository.query.Param;
 import za.co.fnb.dcre.crw.data.model.CrwEmissionEntity;
 import za.co.fnb.dcre.crw.data.model.DueArrivalRow;
-import za.co.fnb.dcre.crw.data.model.DueRow;
 import za.co.fnb.dcre.crw.data.model.FuturedCountRow;
 import za.co.fnb.dcre.crw.data.model.FuturedRow;
 import za.co.fnb.dcre.crw.data.model.PlanTotals;
@@ -14,7 +13,6 @@ import za.co.fnb.dcre.crw.data.model.PlanTotals;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.List;
-import java.util.Optional;
 import java.util.UUID;
 
 public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID> {
@@ -23,10 +21,11 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
      * Arrivals with at least one transaction scheduled for the run date
      * (SCRUM-42 load fix): scalars only, one row per arrival, no per-tx
      * fanout. The 23x300k whole-backlog join blew CRDB's sql memory budget
-     * (joinreader-mem) live, so per-tx rows are fetched per arrival in
-     * {@link #findDueForArrival}. Validation is checked there too: an arrival
-     * whose due rows all failed validation lists here, fetches empty, and is
-     * skipped without a claim (same net outcome as the old joined query).
+     * (joinreader-mem) live, so per-tx work happens per arrival inside its
+     * own transaction (SplitPlanner planning queries + set-based member
+     * claims). Validation is checked there too: an arrival whose due rows
+     * all failed validation lists here, plans empty, and is skipped without
+     * a claim (same net outcome as the old joined query).
      */
     @Query(value = """
             SELECT DISTINCT s.arrival_id, h.initg_pty, h.msg_id
@@ -35,17 +34,6 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
             WHERE s.process_date = :runDate
             ORDER BY s.arrival_id""", rowMapperClass = DueArrivalRowMapper.class)
     List<DueArrivalRow> findDueArrivals(@Param("runDate") LocalDate runDate);
-
-    /** ONE arrival's transactions due on the run date (R-37): PASS verdict + schedule hits the run date. */
-    @Query(value = """
-            SELECT t.arrival_id, h.initg_pty, h.msg_id, t.sequence, t.e2e, t.amount
-            FROM cde_schedule s
-            JOIN validation_log v ON v.arrival_id = s.arrival_id AND v.sequence = s.sequence AND v.outcome = 'PASS'
-            JOIN tx_entry t ON t.arrival_id = s.arrival_id AND t.sequence = s.sequence
-            JOIN tx_header h ON h.arrival_id = s.arrival_id
-            WHERE s.process_date = :runDate AND s.arrival_id = :arrivalId
-            ORDER BY t.sequence""", rowMapperClass = DueRowMapper.class)
-    List<DueRow> findDueForArrival(@Param("runDate") LocalDate runDate, @Param("arrivalId") UUID arrivalId);
 
     /**
      * Warehoused (futured) counts per (arrival, process date) group past the
@@ -116,8 +104,6 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
                     :#{#e.outboundMsgId}, :#{#e.fileName}, :#{#e.state})
             ON CONFLICT (arrival_id, run_date, batch_ordinal) DO NOTHING""")
     void claimSnapshot(@Param("e") CrwEmissionEntity e);
-
-    Optional<CrwEmissionEntity> findByArrivalIdAndRunDate(UUID arrivalId, LocalDate runDate);
 
     List<CrwEmissionEntity> findByArrivalIdAndRunDateOrderByBatchOrdinal(UUID arrivalId, LocalDate runDate);
 

@@ -139,8 +139,8 @@ class CrwJobTest {
                         .filter(e -> e.getLevel() == Level.WARN)
                         .map(ILoggingEvent::getFormattedMessage)
                         .anyMatch(m -> m.equals("excluded stage=CRW arrival=" + arrival
-                                + " seq=-1 e2e=- reason=ALREADY_VISIBLE")),
-                "file-level ALREADY_VISIBLE WARN (R-38 exclusion visibility)");
+                                + " seq=-1 e2e=- reason=ALREADY_VISIBLE batch=1")),
+                "file-level ALREADY_VISIBLE WARN (R-38 exclusion visibility, SCRUM-55 batch grain)");
         emissionLogger.detachAppender(warns);
     }
 

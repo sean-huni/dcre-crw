@@ -183,8 +183,8 @@ public class CrwEmissionSteps {
     public void alreadyVisibleWarningLogged() {
         assertTrue(arrivalWarns().stream()
                         .anyMatch(m -> m.equals("excluded stage=CRW arrival=" + arrival
-                                + " seq=-1 e2e=- reason=ALREADY_VISIBLE")),
-                "single file-level ALREADY_VISIBLE WARN (seq=-1, e2e=-)");
+                                + " seq=-1 e2e=- reason=ALREADY_VISIBLE batch=1")),
+                "single file-level ALREADY_VISIBLE WARN (seq=-1, e2e=-, SCRUM-55 batch grain)");
     }
 
     private List<String> arrivalWarns() {

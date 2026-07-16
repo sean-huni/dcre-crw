@@ -58,7 +58,7 @@ class CrwJobConfigRetryTest {
     @Test
     void emitStepRetriesCommitTimeCrdbAbortsThenCompletes() throws Exception {
         final var emissions = new AtomicInteger();
-        final EmissionService countingService = new EmissionService(null, null, null, null,
+        final EmissionService countingService = new EmissionService(null, null, null, null, null,
                 new ResourcelessTransactionManager()) {
             @Override
             public int emitDue(final LocalDate runDate) {
