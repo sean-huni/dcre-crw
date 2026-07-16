@@ -1,12 +1,9 @@
 package za.co.fnb.dcre.crw.config;
 
-import org.springframework.batch.core.BatchStatus;
 import org.springframework.batch.core.configuration.annotation.JobScope;
 import org.springframework.batch.core.configuration.annotation.StepScope;
 import org.springframework.batch.core.job.Job;
-import org.springframework.batch.core.job.JobExecution;
 import org.springframework.batch.core.job.builder.JobBuilder;
-import org.springframework.batch.core.listener.JobExecutionListener;
 import org.springframework.batch.core.repository.JobRepository;
 import org.springframework.batch.core.step.Step;
 import org.springframework.batch.core.step.builder.StepBuilder;
@@ -23,12 +20,11 @@ import za.co.fnb.dcre.crw.service.EmissionService;
 import za.co.fnb.dcre.crw.service.EmissionTasklet;
 import za.co.fnb.dcre.crw.service.LaneEmissionService;
 import za.co.fnb.dcre.platform.batch.CrdbRetryExceptionHandler;
-import za.co.fnb.dcre.platform.batch.OutcomeFileWriter;
+import za.co.fnb.dcre.platform.batch.OutcomeSeamListener;
 import za.co.fnb.dcre.platform.batch.PartitionSizer;
 import za.co.fnb.dcre.platform.batch.StaleExecutionSweeper;
 
 import javax.sql.DataSource;
-import java.nio.file.Path;
 import java.time.LocalDate;
 
 /**
@@ -81,8 +77,10 @@ public class CrwJobConfig {
 
     @Bean
     public Job crwJob(JobRepository repo, Step emitStep, @Value("${dcre.exchange-root}") String exchangeRoot) {
+        // SCRUM-58: shared platform-batch seam listener (COMPLETED-gated, constant
+        // BUSINESS_ACCEPTED verdict preserved; local fallback local-crw-<executionId>).
         return new JobBuilder("crwJob", repo)
-                .listener(new SeamListener(exchangeRoot))
+                .listener(new OutcomeSeamListener("crw", exchangeRoot, execution -> "BUSINESS_ACCEPTED"))
                 .start(emitStep)
                 .build();
     }
@@ -91,17 +89,5 @@ public class CrwJobConfig {
     @Order(-10)
     public ApplicationRunner staleExecutionSweep(DataSource dataSource) {
         return args -> StaleExecutionSweeper.abandonStale(dataSource, "CRW_BATCH_", 60);
-    }
-
-    record SeamListener(String exchangeRoot) implements JobExecutionListener {
-
-        @Override
-        public void afterJob(JobExecution execution) {
-            if (execution.getStatus() != BatchStatus.COMPLETED) {
-                return;
-            }
-            String jobName = System.getenv().getOrDefault("JOB_NAME", "local-" + execution.getId());
-            OutcomeFileWriter.write(Path.of(exchangeRoot), jobName, "BUSINESS_ACCEPTED");
-        }
     }
 }
