@@ -117,7 +117,7 @@ class EmissionServiceRetryTest {
     }
 
     private CrwEmissionEntity stubEmission(final UUID arrival, final String fileName) {
-        final CrwEmissionEntity emission = CrwEmissionEntity.planned(arrival, RUN_DATE, fileName);
+        final CrwEmissionEntity emission = CrwEmissionEntity.plannedBatch(null, arrival, RUN_DATE, 1, null, fileName);
         when(emissions.findByArrivalIdAndRunDate(arrival, RUN_DATE)).thenReturn(Optional.of(emission));
         return emission;
     }

@@ -70,17 +70,31 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
     List<FuturedRow> findFuturedForArrival(@Param("arrivalId") UUID arrivalId,
                                            @Param("processDate") LocalDate processDate);
 
-    /** Snapshot claim (R-24): first writer wins; a restart sees empty and reuses the existing snapshot. */
+    /**
+     * Snapshot claim (R-24) at batch grain (SCRUM-55): first writer wins on the
+     * FULL identity (arrival_id, run_date, batch_ordinal); a restart no-ops and
+     * reuses the existing batch row.
+     */
     @Modifying
     @Query("""
-            INSERT INTO crw_emission (id, arrival_id, run_date, file_name, state)
-            VALUES (:#{#e.id}, :#{#e.arrivalId}, :#{#e.runDate}, :#{#e.fileName}, :#{#e.state})
-            ON CONFLICT (arrival_id, run_date) DO NOTHING""")
+            INSERT INTO crw_emission (id, group_id, arrival_id, run_date, batch_ordinal,
+                                      outbound_msg_id, file_name, state)
+            VALUES (:#{#e.id}, :#{#e.groupId}, :#{#e.arrivalId}, :#{#e.runDate}, :#{#e.batchOrdinal},
+                    :#{#e.outboundMsgId}, :#{#e.fileName}, :#{#e.state})
+            ON CONFLICT (arrival_id, run_date, batch_ordinal) DO NOTHING""")
     void claimSnapshot(@Param("e") CrwEmissionEntity e);
 
     Optional<CrwEmissionEntity> findByArrivalIdAndRunDate(UUID arrivalId, LocalDate runDate);
 
+    List<CrwEmissionEntity> findByArrivalIdAndRunDateOrderByBatchOrdinal(UUID arrivalId, LocalDate runDate);
+
     @Modifying
     @Query("UPDATE crw_emission SET state = :state, updated_at = now() WHERE id = :id AND state <> :state")
     void transition(@Param("id") UUID id, @Param("state") String state);
+
+    /** Ordinal publication (SCRUM-55): the atomic VISIBLE move stamps visible_at for SLA timers. */
+    @Modifying
+    @Query("UPDATE crw_emission SET state = 'VISIBLE', visible_at = now(), updated_at = now()"
+            + " WHERE id = :id AND state <> 'VISIBLE'")
+    void markVisible(@Param("id") UUID id);
 }

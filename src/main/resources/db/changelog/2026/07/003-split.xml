@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- SCRUM-55: group/batch grain. CRW single writer (R-04) unchanged. -->
+    <changeSet id="003-split-group" author="dcre">
+        <preConditions onFail="MARK_RAN"><not><tableExists tableName="crw_emission_group"/></not></preConditions>
+        <createTable tableName="crw_emission_group">
+            <column name="id" type="UUID" defaultValueComputed="gen_random_uuid()"><constraints primaryKey="true" nullable="false"/></column>
+            <column name="arrival_id" type="UUID"><constraints nullable="false"/></column>
+            <column name="client" type="VARCHAR(16)"><constraints nullable="false"/></column>
+            <column name="source_msg_id" type="VARCHAR(35)"><constraints nullable="false"/></column>
+            <column name="run_date" type="DATE"><constraints nullable="false"/></column>
+            <column name="applied_max" type="INT"><constraints nullable="false"/></column>
+            <column name="total_tx" type="BIGINT"><constraints nullable="false"/></column>
+            <column name="total_amount" type="DECIMAL(18,2)"><constraints nullable="false"/></column>
+            <column name="expected_batch_count" type="INT"><constraints nullable="false"/></column>
+            <column name="split" type="BOOLEAN"><constraints nullable="false"/></column>
+            <column name="version" type="BIGINT" defaultValueNumeric="0"><constraints nullable="false"/></column>
+            <column name="created_at" type="TIMESTAMPTZ" defaultValueComputed="now()"><constraints nullable="false"/></column>
+            <column name="updated_at" type="TIMESTAMPTZ" defaultValueComputed="now()"><constraints nullable="false"/></column>
+        </createTable>
+        <addUniqueConstraint tableName="crw_emission_group" columnNames="arrival_id, run_date" constraintName="uq_emission_group_arrival_run"/>
+        <addUniqueConstraint tableName="crw_emission_group" columnNames="client, source_msg_id, run_date" constraintName="uq_emission_group_client_msg_run"/>
+    </changeSet>
+
+    <changeSet id="003-split-batch-columns" author="dcre">
+        <preConditions onFail="MARK_RAN"><not><columnExists tableName="crw_emission" columnName="batch_ordinal"/></not></preConditions>
+        <addColumn tableName="crw_emission">
+            <column name="group_id" type="UUID"/>
+            <column name="batch_ordinal" type="INT" defaultValueNumeric="1"><constraints nullable="false"/></column>
+            <column name="outbound_msg_id" type="VARCHAR(64)"/>
+            <column name="tx_count" type="BIGINT"/>
+            <column name="control_sum" type="DECIMAL(18,2)"/>
+            <column name="visible_at" type="TIMESTAMPTZ"/>
+        </addColumn>
+    </changeSet>
+
+    <changeSet id="003-split-batch-identity" author="dcre">
+        <preConditions onFail="MARK_RAN"><uniqueConstraintExists tableName="crw_emission" constraintName="crw_emission_arrival_id_run_date_key"/></preConditions>
+        <dropUniqueConstraint tableName="crw_emission" constraintName="crw_emission_arrival_id_run_date_key"/>
+    </changeSet>
+
+    <changeSet id="003-split-batch-uniques" author="dcre">
+        <preConditions onFail="MARK_RAN"><not><indexExists indexName="uq_emission_arrival_run_ordinal"/></not></preConditions>
+        <addUniqueConstraint tableName="crw_emission" columnNames="arrival_id, run_date, batch_ordinal" constraintName="uq_emission_arrival_run_ordinal"/>
+        <createIndex tableName="crw_emission" indexName="uq_emission_outbound_msg" unique="true">
+            <column name="outbound_msg_id"/>
+        </createIndex>
+    </changeSet>
+
+    <changeSet id="003-split-backfill" author="dcre">
+        <!-- LIQUIBASE-SQL-EXCEPTION: INSERT..SELECT backfill (DML) has no typed-tag equivalent.
+             Legacy pre-split rows become single-batch groups so every reader join stays total. -->
+        <sql>
+            INSERT INTO crw_emission_group (arrival_id, client, source_msg_id, run_date, applied_max,
+                                            total_tx, total_amount, expected_batch_count, split)
+            SELECT e.arrival_id, split_part(e.file_name, '_', 1), split_part(e.file_name, '_', 2),
+                   e.run_date, 0,
+                   (SELECT count(*) FROM crw_emission_member m WHERE m.emission_id = e.id),
+                   COALESCE((SELECT sum(m.amount) FROM crw_emission_member m WHERE m.emission_id = e.id), 0),
+                   1, false
+            FROM crw_emission e
+            WHERE e.group_id IS NULL
+            ON CONFLICT (arrival_id, run_date) DO NOTHING;
+            UPDATE crw_emission e SET group_id = g.id,
+                   outbound_msg_id = COALESCE(e.outbound_msg_id, g.source_msg_id)
+            FROM crw_emission_group g
+            WHERE g.arrival_id = e.arrival_id AND g.run_date = e.run_date AND e.group_id IS NULL;
+        </sql>
+    </changeSet>
+</databaseChangeLog>

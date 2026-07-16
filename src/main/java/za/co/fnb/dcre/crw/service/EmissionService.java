@@ -143,7 +143,9 @@ public class EmissionService {
         String msgId = arrival.msgId();
         String fileName = client + "_" + msgId + "_PAIN008.xml";
 
-        CrwEmissionEntity candidate = CrwEmissionEntity.planned(arrivalId, runDate, fileName);
+        // SCRUM-55 interim (Task 1): single ordinal-1 batch, bare source MsgId as outbound
+        // identity; the SplitPlanner rewrite (Task 4) replaces this whole method.
+        CrwEmissionEntity candidate = CrwEmissionEntity.plannedBatch(null, arrivalId, runDate, 1, msgId, fileName);
         emissions.claimSnapshot(candidate);
         CrwEmissionEntity emission = emissions.findByArrivalIdAndRunDate(arrivalId, runDate).orElseThrow();
         if ("VISIBLE".equals(emission.getState())) {
