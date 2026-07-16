@@ -154,7 +154,11 @@ class EmissionSplitIT extends CrwTestcontainersBase {
     void killBetweenPlanCommitAndPublicationResumesExactlyTheMissingBatches() throws Exception {
         UUID arrivalId = UUID.randomUUID();
         LocalDate runDate = LocalDate.of(2026, 8, 8);
-        seedDueArrival(arrivalId, "FNBRF01", "DCRERF2026071600000014", 12001, runDate);
+        // Unique per-run msgId (CrwJobTest shape): build/test-exchange survives
+        // between gradle runs, and this test asserts file ABSENCE mid-flow, so a
+        // fixed name would trip over the previous run's published artifact.
+        String msgId = "DCRERFSEAM" + arrivalId.toString().substring(0, 8);
+        seedDueArrival(arrivalId, "FNBRF01", msgId, 12001, runDate);
         FlakyPain008Writer flaky = new FlakyPain008Writer();
         EmissionService flakyService = new EmissionService(emissions, members, flaky, layout, planner, txManager);
         flaky.failEveryBuild(); // crash at the seam: plan committed, no batch published
