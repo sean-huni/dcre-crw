@@ -26,9 +26,11 @@ import java.util.List;
 
 /**
  * Business tier: the R-37 Process-Date Executor at batch grain (SCRUM-55).
- * Each due parent is planned by the SplitPlanner inside ONE REQUIRES_NEW
- * arrival transaction (snapshot-consistent plan) and its batches are built
- * and published strictly in ordinal order: _2 never VISIBLE before _1.
+ * Each due parent runs TWO durability phases (review fix, durable-effect
+ * ordering): the plan transaction commits group, batches, frozen members and
+ * totals (MATERIALIZED) BEFORE any file exists; publication then walks the
+ * committed batches strictly in ordinal order (_2 never VISIBLE before _1),
+ * per batch StagedWrite then markVisible in its own small transaction.
  * Restart keys are per batch (arrival, run_date, ordinal) plus the
  * file-existence no-op (R-05); each file reconciles against its OWN frozen
  * tx_count before building (R-24 frozen-plan integrity).
@@ -46,7 +48,7 @@ public class EmissionService {
     private final Pain008Writer painWriter;
     private final ExchangeLayout layout;
     private final SplitPlanner planner;
-    private final TransactionTemplate arrivalTx;
+    private final TransactionTemplate requiresNewTx;
 
     public EmissionService(final CrwEmissionRepo emissions, final CrwEmissionMemberRepo members,
                            final Pain008Writer painWriter, final ExchangeLayout layout,
@@ -59,21 +61,24 @@ public class EmissionService {
         // SCRUM-42 load fix: each arrival commits in its OWN transaction so a
         // 300k-tx window ratchets progress arrival by arrival; and a CRDB 40001
         // abort poisons the surrounding transaction (25P02 on any further
-        // statement), so a retry needs a fresh transaction per attempt.
-        this.arrivalTx = new TransactionTemplate(txManager);
-        this.arrivalTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        // statement), so a retry needs a fresh transaction per attempt. The
+        // same template serves BOTH the plan transaction and each per-batch
+        // publication transaction (SCRUM-55 durable-effect ordering).
+        this.requiresNewTx = new TransactionTemplate(txManager);
+        this.requiresNewTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
     }
 
     /**
      * Step-transaction reads are arrival-level scalars ONLY (futured count
      * aggregates + due-arrival listing): the 23x300k whole-backlog per-tx
      * join blew CRDB's sql memory budget (joinreader-mem) live. Every arrival
-     * then commits in its own REQUIRES_NEW transaction so one failure never
+     * then plans in its own REQUIRES_NEW transaction so one failure never
      * rolls back sibling emissions. A failed arrival is logged and skipped;
-     * the window still reports FAILED at the end (the next window re-picks
-     * exactly the unclaimed arrivals). Whole-run variant, kept as the direct
-     * entry point for tests and manual runs; the job goes through the
-     * client-scoped overload per lane (SCRUM-55 Feature 2).
+     * the window still reports FAILED at the end (the next window resumes
+     * exactly the unplanned arrivals and unpublished batches). Whole-run
+     * variant, kept as the direct entry point for tests and manual runs; the
+     * job goes through the client-scoped overload per lane (SCRUM-55
+     * Feature 2).
      *
      * @return number of pain.008 FILES emitted for the run date (batch grain).
      */
@@ -137,23 +142,24 @@ public class EmissionService {
         }
     }
 
-    /** One parent = one committed unit: fresh REQUIRES_NEW tx per bounded-retry attempt. */
+    /**
+     * One parent, two durability phases. Phase 1 (fresh REQUIRES_NEW tx per
+     * bounded-retry attempt) commits the WHOLE plan: group, batches, frozen
+     * members and totals, MATERIALIZED. NO file leaves phase 1: a file
+     * published before its plan commits can be consumed by Fintegrate while
+     * a crash rolls the plan back, and a legitimately shifted replan (CDE
+     * re-ran) would orphan that file's identity. Phase 2 publishes strictly
+     * in ordinal order; after a kill between plan commit and publication the
+     * resume publishes exactly the unpublished ordinals of the SAME plan.
+     * The batch rows returned by phase 1 carry state AND frozen identity
+     * from the one snapshot that also computed the prior-artifact offset
+     * (crw-5): publication decides "unpublished" and names files from those
+     * rows only, never from a separate committed-rows-at-large read.
+     */
     private int emitArrival(final DueArrivalRow arrival, final LocalDate runDate) {
-        Integer files = CrdbRetry.run("emit arrival=%s".formatted(arrival.arrivalId()), () ->
-                arrivalTx.execute(status -> {
-                    try {
-                        return emitParent(arrival, runDate);
-                    } catch (final IOException e) {
-                        throw new UncheckedIOException(e);
-                    }
-                }));
-        return files == null ? 0 : files;
-    }
-
-    /** Plan + build ALL of the parent's batches inside the one arrival tx; ordinal order = publication order. */
-    private int emitParent(final DueArrivalRow arrival, final LocalDate runDate) throws IOException {
-        List<CrwEmissionEntity> batches = planner.planAndClaim(arrival, runDate);
-        if (batches.isEmpty()) {
+        final List<CrwEmissionEntity> batches = CrdbRetry.run("plan arrival=%s".formatted(arrival.arrivalId()),
+                () -> requiresNewTx.execute(status -> planner.planAndClaim(arrival, runDate)));
+        if (batches == null || batches.isEmpty()) {
             return 0;
         }
         int emitted = 0;
@@ -165,22 +171,43 @@ public class EmissionService {
                         arrival.arrivalId(), batch.getBatchOrdinal());
                 continue;
             }
-            // Build strictly from the immutable snapshot, never the live selection (R-24).
-            List<CrwEmissionMemberEntity> snapshot = members.findByEmissionIdOrderBySequence(batch.getId());
-            if (batch.getTxCount() == null || snapshot.size() != batch.getTxCount()) {
-                throw new IllegalStateException(
-                        "frozen-plan mismatch stage=CRW arrival=%s batch=%d members=%d expected=%s"
-                                .formatted(arrival.arrivalId(), batch.getBatchOrdinal(), snapshot.size(),
-                                        batch.getTxCount()));
-            }
-            List<String> xml = painWriter.build(batch.getOutboundMsgId(), snapshot, batch.getControlSum());
-            // SCRUM-42: per-client fint-req/out leaf. An unconfigured client fails closed here (resolve throws).
-            Path target = layout.resolve(arrival.client(), ExchangeChannel.FINT_REQ, ExchangeSub.OUT)
-                    .resolve(batch.getFileName());
-            StagedWrite.write(target, xml);          // per-batch file-existence restart no-op (R-05)
-            emissions.markVisible(batch.getId());    // stamps visible_at for the SLA timer
+            publishBatch(arrival, batch);
             emitted++;
         }
         return emitted;
+    }
+
+    /**
+     * Publishes ONE committed batch: StagedWrite then markVisible inside a
+     * small REQUIRES_NEW transaction per bounded-retry attempt. The XML
+     * builds strictly from the immutable member snapshot, never the live
+     * selection (R-24), and reconciles against the batch's OWN frozen
+     * tx_count; identity (outbound MsgId, file name) comes ONLY from the
+     * stored row. A replay is a per-batch file-existence StagedWrite no-op
+     * (R-05) and markVisible is state-guarded, so a crash anywhere in this
+     * method resumes cleanly.
+     */
+    private void publishBatch(final DueArrivalRow arrival, final CrwEmissionEntity batch) {
+        CrdbRetry.run("publish arrival=%s batch=%d".formatted(arrival.arrivalId(), batch.getBatchOrdinal()),
+                () -> requiresNewTx.execute(status -> {
+                    List<CrwEmissionMemberEntity> snapshot = members.findByEmissionIdOrderBySequence(batch.getId());
+                    if (batch.getTxCount() == null || snapshot.size() != batch.getTxCount()) {
+                        throw new IllegalStateException(
+                                "frozen-plan mismatch stage=CRW arrival=%s batch=%d members=%d expected=%s"
+                                        .formatted(arrival.arrivalId(), batch.getBatchOrdinal(), snapshot.size(),
+                                                batch.getTxCount()));
+                    }
+                    List<String> xml = painWriter.build(batch.getOutboundMsgId(), snapshot, batch.getControlSum());
+                    // SCRUM-42: per-client fint-req/out leaf. An unconfigured client fails closed here (resolve throws).
+                    Path target = layout.resolve(arrival.client(), ExchangeChannel.FINT_REQ, ExchangeSub.OUT)
+                            .resolve(batch.getFileName());
+                    try {
+                        StagedWrite.write(target, xml);      // per-batch file-existence restart no-op (R-05)
+                    } catch (final IOException e) {
+                        throw new UncheckedIOException(e);
+                    }
+                    emissions.markVisible(batch.getId());    // stamps visible_at for the SLA timer
+                    return null;
+                }));
     }
 }

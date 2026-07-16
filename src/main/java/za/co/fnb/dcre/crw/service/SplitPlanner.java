@@ -19,7 +19,9 @@ import java.util.UUID;
  * Business tier: forms the SCRUM-55 split plan inside the caller's arrival
  * transaction (one CRDB snapshot) and claims group, batches and members
  * set-based. Claim-once at every level: a replay finds the stored plan and
- * returns it; a config change never repartitions an existing plan.
+ * returns it; a config change never repartitions an existing plan. The plan
+ * transaction is publication-free: batches end MATERIALIZED and files are
+ * written only after it commits (durable-effect ordering).
  */
 @Service
 public class SplitPlanner {
@@ -37,7 +39,14 @@ public class SplitPlanner {
         this.split = split;
     }
 
-    /** Inside the caller's arrival tx. Claim-once: a replay finds the stored plan and returns it. */
+    /**
+     * Inside the caller's arrival tx. Claim-once: a replay finds the stored
+     * plan and returns it. The returned rows carry state and frozen identity
+     * (outbound MsgId, file name) read in the SAME snapshot that computed the
+     * prior-artifact offset (crw-5): the caller publishes the unpublished
+     * batches from exactly these rows after commit and never recomputes
+     * identity from a separate committed-rows-at-large read.
+     */
     public List<CrwEmissionEntity> planAndClaim(final DueArrivalRow arrival, final LocalDate runDate) {
         if (!TransactionSynchronizationManager.isActualTransactionActive()) {
             throw new IllegalStateException(
@@ -94,9 +103,11 @@ public class SplitPlanner {
                 members.claimMembers(batch.getId(), runDate, g.getArrivalId(), lo + 1, hi);
                 var totals = members.batchTotals(batch.getId());
                 emissions.freezeTotals(batch.getId(), totals.count(), totals.sum());
-                // internal sub-state between PLANNED and MATERIALIZED: members frozen,
-                // file not built yet, so a crash between claim and freeze replays deterministically
-                emissions.transition(batch.getId(), "MATERIALIZED_MEMBERS");
+                // MATERIALIZED is the plan tx's terminal state: members and totals
+                // frozen, NO file yet. Publication (StagedWrite then markVisible)
+                // happens only AFTER this transaction commits (SCRUM-55 review
+                // fix, durable-effect ordering).
+                emissions.transition(batch.getId(), "MATERIALIZED");
             }
             lo = hi == -1 ? lo : hi;
         }

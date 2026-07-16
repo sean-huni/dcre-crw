@@ -112,11 +112,11 @@ class EmissionServiceRetryTest {
                 "the survivor parent emitted despite the earlier parent's failure");
     }
 
-    /** Built batch stub: MATERIALIZED_MEMBERS with frozen totals matching the one stubbed member. */
+    /** Committed-plan batch stub: MATERIALIZED with frozen totals matching the one stubbed member. */
     private CrwEmissionEntity stubBatch(final String outboundMsgId, final String fileName) {
         final CrwEmissionEntity batch = mock(CrwEmissionEntity.class);
         when(batch.getId()).thenReturn(UUID.randomUUID());
-        when(batch.getState()).thenReturn("MATERIALIZED_MEMBERS");
+        when(batch.getState()).thenReturn("MATERIALIZED");
         when(batch.getBatchOrdinal()).thenReturn(1);
         when(batch.getOutboundMsgId()).thenReturn(outboundMsgId);
         when(batch.getFileName()).thenReturn(fileName);

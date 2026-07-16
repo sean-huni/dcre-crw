@@ -134,7 +134,13 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
      * (a matured-warehoused re-emission is a NEW physical artifact), so bare
      * MsgId and _N identities never repeat within a parent. Runs inside the
      * arrival transaction; committed prior plans are immutable, so the offset
-     * is stable for every replay of this (arrival, run_date).
+     * is stable for every replay of this (arrival, run_date). crw-5 residual:
+     * this count executes in the SAME plan-tx snapshot as the batch selection
+     * the caller publishes from, and it is trustworthy ONLY because files are
+     * published strictly AFTER their rows commit (durable-effect ordering):
+     * committed rows are therefore the COMPLETE artifact registry. Never call
+     * this at publication time to (re)derive names; publication uses the
+     * stored outbound_msg_id/file_name of the selected unpublished rows.
      */
     @Query("SELECT count(*) FROM crw_emission WHERE arrival_id = :arrivalId AND run_date <> :runDate")
     long countPriorArtifacts(@Param("arrivalId") UUID arrivalId, @Param("runDate") LocalDate runDate);

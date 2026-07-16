@@ -139,6 +139,50 @@ class EmissionSplitIT extends CrwTestcontainersBase {
         assertThat(memberTotalAcrossBatches(arrivalId)).isEqualTo(9L); // no dup members across run dates
     }
 
+    /**
+     * Durable-effect ordering (SCRUM-55 review fix): the plan transaction
+     * must commit plan+members+frozen totals (MATERIALIZED) BEFORE any file
+     * is published. A kill between that commit and publication leaves the
+     * whole frozen plan durable with ZERO files; the resume publishes
+     * exactly the missing batches from the SAME committed rows (no replan
+     * drift: identical batch ids, identical names, identical member set).
+     * Pre-fix the file write lived inside the arrival transaction, so this
+     * crash window instead rolled the plan back under an already-buildable
+     * file, orphaning published artifacts.
+     */
+    @Test
+    void killBetweenPlanCommitAndPublicationResumesExactlyTheMissingBatches() throws Exception {
+        UUID arrivalId = UUID.randomUUID();
+        LocalDate runDate = LocalDate.of(2026, 8, 8);
+        seedDueArrival(arrivalId, "FNBRF01", "DCRERF2026071600000014", 12001, runDate);
+        FlakyPain008Writer flaky = new FlakyPain008Writer();
+        EmissionService flakyService = new EmissionService(emissions, members, flaky, layout, planner, txManager);
+        flaky.failEveryBuild(); // crash at the seam: plan committed, no batch published
+
+        assertThatThrownBy(() -> flakyService.emitDue(runDate)).isInstanceOf(IllegalStateException.class);
+
+        // The plan survived the kill: batches durable in MATERIALIZED, members frozen, ZERO files.
+        var planned = emissions.findByArrivalIdAndRunDateOrderByBatchOrdinal(arrivalId, runDate);
+        assertThat(planned).hasSize(3);
+        assertThat(planned).extracting(CrwEmissionEntity::getState).containsOnly("MATERIALIZED");
+        assertThat(memberTotalAcrossBatches(arrivalId)).isEqualTo(12001L);
+        for (final CrwEmissionEntity batch : planned) {
+            assertThat(out().resolve(batch.getFileName())).doesNotExist();
+        }
+        List<UUID> plannedIds = planned.stream().map(CrwEmissionEntity::getId).toList();
+
+        flaky.heal();
+        assertThat(flakyService.emitDue(runDate)).isEqualTo(3); // resume publishes EXACTLY the 3 missing batches
+
+        var resumed = emissions.findByArrivalIdAndRunDateOrderByBatchOrdinal(arrivalId, runDate);
+        assertThat(resumed).extracting(CrwEmissionEntity::getId).containsExactlyElementsOf(plannedIds);
+        assertThat(resumed).extracting(CrwEmissionEntity::getState).containsOnly("VISIBLE");
+        for (final CrwEmissionEntity batch : resumed) {
+            assertThat(out().resolve(batch.getFileName())).exists();
+        }
+        assertThat(memberTotalAcrossBatches(arrivalId)).isEqualTo(12001L); // no member drift
+    }
+
     @Test
     void alreadyVisibleParentIsAPerParentNoOpWarn() {
         UUID arrivalId = UUID.randomUUID();
@@ -162,26 +206,34 @@ class EmissionSplitIT extends CrwTestcontainersBase {
                 .contains("excluded stage=CRW arrival=" + arrivalId + " seq=-1 e2e=- reason=ALREADY_VISIBLE batch=1");
     }
 
-    /** Delegates to the real writer; while failing, the SECOND build (batch 2) throws, after file 1 landed. */
+    /** Delegates to the real writer; while failing, every build past the threshold throws (0 = all). */
     static final class FlakyPain008Writer extends Pain008Writer {
 
         private final AtomicInteger builds = new AtomicInteger();
-        private volatile boolean failing;
+        private volatile int failAfterBuilds = Integer.MAX_VALUE;
 
+        /** Crash between batch 1 VISIBLE and batch 2: file 1 lands, the second build throws. */
         void failAfterFirstBuild() {
-            failing = true;
+            failAfterBuilds = 1;
+            builds.set(0);
+        }
+
+        /** Crash at the plan-commit/publication seam: no batch of the parent ever publishes. */
+        void failEveryBuild() {
+            failAfterBuilds = 0;
             builds.set(0);
         }
 
         void heal() {
-            failing = false;
+            failAfterBuilds = Integer.MAX_VALUE;
         }
 
         @Override
         public List<String> build(final String outboundMsgId, final List<CrwEmissionMemberEntity> snapshot,
                                   final BigDecimal controlSum) {
-            if (failing && builds.incrementAndGet() > 1) {
-                throw new IllegalStateException("simulated crash between batch 1 VISIBLE and batch 2");
+            if (builds.incrementAndGet() > failAfterBuilds) {
+                throw new IllegalStateException("simulated crash during publication (build %d past threshold %d)"
+                        .formatted(builds.get(), failAfterBuilds));
             }
             return super.build(outboundMsgId, snapshot, controlSum);
         }

@@ -14,7 +14,8 @@ import java.util.List;
  * parents follow insertion-order FIFO eligibility (client-scoped due query).
  * A failed client is logged and skipped so sibling clients in the same lane
  * still emit; the lane then fails to keep the window outcome honest (the
- * next window re-picks exactly the unclaimed work).
+ * next window resumes exactly the unplanned arrivals and unpublished
+ * batches, SCRUM-55 durable-effect ordering).
  */
 @Service
 public class LaneEmissionService {
