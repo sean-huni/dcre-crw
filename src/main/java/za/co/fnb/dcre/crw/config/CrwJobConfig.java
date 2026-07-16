@@ -10,6 +10,7 @@ import org.springframework.batch.core.step.Step;
 import org.springframework.batch.core.step.builder.StepBuilder;
 import org.springframework.boot.ApplicationRunner;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.annotation.Order;
@@ -23,6 +24,7 @@ import javax.sql.DataSource;
 import java.nio.file.Path;
 
 @Configuration
+@EnableConfigurationProperties(CrwSplitProperties.class)
 public class CrwJobConfig {
 
     @Bean
