@@ -71,13 +71,33 @@ public class EmissionService {
      * then commits in its own REQUIRES_NEW transaction so one failure never
      * rolls back sibling emissions. A failed arrival is logged and skipped;
      * the window still reports FAILED at the end (the next window re-picks
-     * exactly the unclaimed arrivals).
+     * exactly the unclaimed arrivals). Whole-run variant, kept as the direct
+     * entry point for tests and manual runs; the job goes through the
+     * client-scoped overload per lane (SCRUM-55 Feature 2).
      *
      * @return number of pain.008 FILES emitted for the run date (batch grain).
      */
     public int emitDue(final LocalDate runDate) {
-        warnFutured(runDate);
-        List<DueArrivalRow> arrivals = emissions.findDueArrivals(runDate);
+        warnFutured(emissions.findFuturedCounts(runDate));
+        return emitAll(emissions.findDueArrivals(runDate), runDate);
+    }
+
+    /**
+     * One client lane's slice of the run (SCRUM-55 Feature 2): FIFO within
+     * the client = eligibility order (tx_header insertion order). Futured
+     * WARNs are client-scoped so parallel lanes never duplicate them.
+     */
+    public int emitDue(final LocalDate runDate, final String client) {
+        warnFutured(emissions.findFuturedCounts(runDate, client));
+        return emitAll(emissions.findDueArrivals(runDate, client), runDate);
+    }
+
+    /** Lane universe for the partitioner: distinct clients with work due on the run date. */
+    public List<String> dueClients(final LocalDate runDate) {
+        return emissions.findDueClients(runDate);
+    }
+
+    private int emitAll(final List<DueArrivalRow> arrivals, final LocalDate runDate) {
         int emitted = 0;
         int failed = 0;
         for (final DueArrivalRow arrival : arrivals) {
@@ -103,8 +123,8 @@ public class EmissionService {
      * memory problem; seq=-1 e2e=- follows the ALREADY_VISIBLE file-level
      * WARN precedent).
      */
-    private void warnFutured(final LocalDate runDate) {
-        for (final FuturedCountRow group : emissions.findFuturedCounts(runDate)) {
+    private void warnFutured(final List<FuturedCountRow> groups) {
+        for (final FuturedCountRow group : groups) {
             if (group.futured() > FUTURED_DETAIL_WARN_LIMIT) {
                 log.warn("excluded stage=CRW arrival={} seq=-1 e2e=- count={} reason=FUTURED_{}",
                         group.arrivalId(), group.futured(), group.processDate());

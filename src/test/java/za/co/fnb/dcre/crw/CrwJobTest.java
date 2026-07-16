@@ -57,7 +57,8 @@ class CrwJobTest {
 
     void seed(UUID arrival, String client, String msgId, int total, String dueDate, String futureDate) {
         jdbc.execute("CREATE TABLE IF NOT EXISTS tx_header (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
-                + " arrival_id UUID UNIQUE, msg_id VARCHAR(35), initg_pty VARCHAR(35))");
+                + " arrival_id UUID UNIQUE, msg_id VARCHAR(35), initg_pty VARCHAR(35),"
+                + " created_at TIMESTAMPTZ NOT NULL DEFAULT now())");
         jdbc.execute("CREATE TABLE IF NOT EXISTS tx_entry (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
                 + " arrival_id UUID, sequence INT, e2e VARCHAR(35), amount DECIMAL(18,2), UNIQUE (arrival_id, sequence))");
         jdbc.execute("CREATE TABLE IF NOT EXISTS validation_log (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"

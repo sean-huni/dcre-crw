@@ -36,6 +36,28 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
     List<DueArrivalRow> findDueArrivals(@Param("runDate") LocalDate runDate);
 
     /**
+     * One client lane's due parents (SCRUM-55 Feature 2), FIFO by eligibility
+     * order: tx_header insertion order (created_at), arrival id as the
+     * deterministic tie-break (insertion order, Sean ruling 9).
+     */
+    @Query(value = """
+            SELECT DISTINCT s.arrival_id, h.initg_pty, h.msg_id, h.created_at
+            FROM cde_schedule s
+            JOIN tx_header h ON h.arrival_id = s.arrival_id
+            WHERE s.process_date = :runDate AND h.initg_pty = :client
+            ORDER BY h.created_at, s.arrival_id""", rowMapperClass = DueArrivalRowMapper.class)
+    List<DueArrivalRow> findDueArrivals(@Param("runDate") LocalDate runDate, @Param("client") String client);
+
+    /** The lane universe for the partitioner: distinct clients with work due on the run date. */
+    @Query(value = """
+            SELECT DISTINCT h.initg_pty
+            FROM cde_schedule s
+            JOIN tx_header h ON h.arrival_id = s.arrival_id
+            WHERE s.process_date = :runDate
+            ORDER BY h.initg_pty""", rowMapperClass = ClientRowMapper.class)
+    List<String> findDueClients(@Param("runDate") LocalDate runDate);
+
+    /**
      * Warehoused (futured) counts per (arrival, process date) group past the
      * run date (R-38 at scale): pure aggregate, never the per-tx fanout that
      * exceeded the sql memory budget on the whole backlog.
@@ -48,6 +70,21 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
             GROUP BY s.arrival_id, s.process_date
             ORDER BY s.arrival_id, s.process_date""", rowMapperClass = FuturedCountRowMapper.class)
     List<FuturedCountRow> findFuturedCounts(@Param("runDate") LocalDate runDate);
+
+    /**
+     * Client-scoped futured counts for a lane run (SCRUM-55 Feature 2): each
+     * lane warns only its own client's warehoused rows so parallel lanes never
+     * duplicate an R-38 WARN.
+     */
+    @Query(value = """
+            SELECT s.arrival_id, s.process_date, count(*) AS futured
+            FROM cde_schedule s
+            JOIN tx_header h ON h.arrival_id = s.arrival_id
+            JOIN validation_log v ON v.arrival_id = s.arrival_id AND v.sequence = s.sequence AND v.outcome = 'PASS'
+            WHERE s.process_date > :runDate AND h.initg_pty = :client
+            GROUP BY s.arrival_id, s.process_date
+            ORDER BY s.arrival_id, s.process_date""", rowMapperClass = FuturedCountRowMapper.class)
+    List<FuturedCountRow> findFuturedCounts(@Param("runDate") LocalDate runDate, @Param("client") String client);
 
     /** ONE (arrival, process date) group's warehoused rows, for per-tx R-38 WARN detail on small groups. */
     @Query(value = """
