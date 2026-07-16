@@ -56,7 +56,8 @@ public class CrwEmissionSteps {
     @Before
     public void setUp() {
         jdbc.execute("CREATE TABLE IF NOT EXISTS tx_header (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
-                + " arrival_id UUID UNIQUE, msg_id VARCHAR(35), initg_pty VARCHAR(35))");
+                + " arrival_id UUID UNIQUE, msg_id VARCHAR(35), initg_pty VARCHAR(35),"
+                + " created_at TIMESTAMPTZ NOT NULL DEFAULT now())");
         jdbc.execute("CREATE TABLE IF NOT EXISTS tx_entry (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
                 + " arrival_id UUID, sequence INT, e2e VARCHAR(35), amount DECIMAL(18,2), UNIQUE (arrival_id, sequence))");
         jdbc.execute("CREATE TABLE IF NOT EXISTS validation_log (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
@@ -183,8 +184,8 @@ public class CrwEmissionSteps {
     public void alreadyVisibleWarningLogged() {
         assertTrue(arrivalWarns().stream()
                         .anyMatch(m -> m.equals("excluded stage=CRW arrival=" + arrival
-                                + " seq=-1 e2e=- reason=ALREADY_VISIBLE")),
-                "single file-level ALREADY_VISIBLE WARN (seq=-1, e2e=-)");
+                                + " seq=-1 e2e=- reason=ALREADY_VISIBLE batch=1")),
+                "single file-level ALREADY_VISIBLE WARN (seq=-1, e2e=-, SCRUM-55 batch grain)");
     }
 
     private List<String> arrivalWarns() {

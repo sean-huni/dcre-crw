@@ -8,7 +8,6 @@ import org.springframework.dao.CannotAcquireLockException;
 import za.co.fnb.dcre.crw.data.model.CrwEmissionEntity;
 import za.co.fnb.dcre.crw.data.model.CrwEmissionMemberEntity;
 import za.co.fnb.dcre.crw.data.model.DueArrivalRow;
-import za.co.fnb.dcre.crw.data.model.DueRow;
 import za.co.fnb.dcre.crw.data.repo.CrwEmissionMemberRepo;
 import za.co.fnb.dcre.crw.data.repo.CrwEmissionRepo;
 import za.co.fnb.dcre.platform.files.ExchangeChannel;
@@ -21,24 +20,25 @@ import java.nio.file.Path;
 import java.time.LocalDate;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.Mockito.doThrow;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * SCRUM-42 load fix: per-arrival REQUIRES_NEW transactions in emitDue. A CRDB
- * 40001 abort on one arrival is retried in a fresh transaction (PRG CrdbRetry
- * shape); a persistently failing arrival is logged, skipped, and reported at
- * the end WITHOUT aborting the loop, so survivor arrivals still emit.
+ * SCRUM-42 load fix at SCRUM-55 batch grain: per-arrival REQUIRES_NEW
+ * transactions in emitDue. A CRDB 40001 abort on one parent is retried in a
+ * fresh transaction (PRG CrdbRetry shape); a persistently failing parent is
+ * logged, skipped, and reported at the end WITHOUT aborting the loop, so
+ * survivor parents still emit.
  */
 class EmissionServiceRetryTest {
 
@@ -55,70 +55,81 @@ class EmissionServiceRetryTest {
 
     private CrwEmissionRepo emissions;
     private CrwEmissionMemberRepo members;
+    private SplitPlanner planner;
     private EmissionService service;
 
     @BeforeEach
     void setUp() {
         emissions = mock(CrwEmissionRepo.class);
         members = mock(CrwEmissionMemberRepo.class);
+        planner = mock(SplitPlanner.class);
         final ExchangeLayout layout = new ExchangeLayout(root, Map.of("FNBRF01",
                 Map.of(ExchangeChannel.FINT_REQ, Map.of(ExchangeSub.OUT, "fnbrf01/fint-req/out"))));
-        service = new EmissionService(emissions, members, new Pain008Writer(), layout,
+        service = new EmissionService(emissions, members, new Pain008Writer(), layout, planner,
                 new ResourcelessTransactionManager());
         when(emissions.findFuturedCounts(RUN_DATE)).thenReturn(List.of());
     }
 
     @Test
-    void transientAbortOnOneArrivalRetriesInFreshTransactionThenEmits() throws Exception {
+    void transientAbortOnOneArrivalRetriesInFreshTransactionThenEmits() {
         when(emissions.findDueArrivals(RUN_DATE)).thenReturn(List.of(
                 new DueArrivalRow(GOOD_ARRIVAL, "FNBRF01", "MSGA")));
-        when(emissions.findDueForArrival(RUN_DATE, GOOD_ARRIVAL)).thenReturn(List.of(
-                due(GOOD_ARRIVAL, "FNBRF01", "MSGA")));
-        final CrwEmissionEntity emission = stubEmission(GOOD_ARRIVAL, "FNBRF01_MSGA_PAIN008.xml");
-        doThrow(ABORT).doThrow(ABORT).doNothing().when(emissions).claimSnapshot(any());
-        when(members.findByEmissionIdOrderBySequence(emission.getId())).thenReturn(List.of(
-                CrwEmissionMemberEntity.of(emission.getId(), 1, "E2EMSGA1", new BigDecimal("10.00"))));
+        final CrwEmissionEntity batch = stubBatch("MSGA", "FNBRF01_MSGA_PAIN008.xml");
+        when(planner.planAndClaim(any(), eq(RUN_DATE)))
+                .thenThrow(ABORT).thenThrow(ABORT).thenReturn(List.of(batch));
+        stubMembers(batch);
 
         final int emitted = service.emitDue(RUN_DATE);
 
-        assertEquals(1, emitted, "two transient aborts on the arrival must retry then succeed");
-        verify(emissions, times(3)).claimSnapshot(any());
+        assertEquals(1, emitted, "two transient aborts on the parent must retry then succeed");
+        verify(planner, times(3)).planAndClaim(any(), eq(RUN_DATE));
         assertTrue(Files.exists(root.resolve("fnbrf01/fint-req/out/FNBRF01_MSGA_PAIN008.xml")),
-                "the retried arrival's pain.008 lands in the per-client leaf");
+                "the retried parent's pain.008 lands in the per-client leaf");
     }
 
     @Test
     void failedArrivalIsSkippedSurvivorsEmitAndTheWindowReportsFailure() {
-        // The failing arrival comes FIRST: the loop must carry on past it.
+        // The failing parent comes FIRST: the loop must carry on past it.
         when(emissions.findDueArrivals(RUN_DATE)).thenReturn(List.of(
                 new DueArrivalRow(BAD_ARRIVAL, "FNBXX99", "MSGB"),
                 new DueArrivalRow(GOOD_ARRIVAL, "FNBRF01", "MSGA")));
-        when(emissions.findDueForArrival(RUN_DATE, BAD_ARRIVAL)).thenReturn(List.of(
-                due(BAD_ARRIVAL, "FNBXX99", "MSGB")));
-        when(emissions.findDueForArrival(RUN_DATE, GOOD_ARRIVAL)).thenReturn(List.of(
-                due(GOOD_ARRIVAL, "FNBRF01", "MSGA")));
-        stubEmission(BAD_ARRIVAL, "FNBXX99_MSGB_PAIN008.xml");
-        final CrwEmissionEntity good = stubEmission(GOOD_ARRIVAL, "FNBRF01_MSGA_PAIN008.xml");
-        when(members.findByEmissionIdOrderBySequence(good.getId())).thenReturn(List.of(
-                CrwEmissionMemberEntity.of(good.getId(), 1, "E2EMSGA1", new BigDecimal("10.00"))));
+        final CrwEmissionEntity badBatch = stubBatch("MSGB", "FNBXX99_MSGB_PAIN008.xml");
+        final CrwEmissionEntity goodBatch = stubBatch("MSGA", "FNBRF01_MSGA_PAIN008.xml");
+        when(planner.planAndClaim(argThat(a -> a != null && BAD_ARRIVAL.equals(a.arrivalId())), eq(RUN_DATE)))
+                .thenReturn(List.of(badBatch));
+        when(planner.planAndClaim(argThat(a -> a != null && GOOD_ARRIVAL.equals(a.arrivalId())), eq(RUN_DATE)))
+                .thenReturn(List.of(goodBatch));
+        stubMembers(badBatch);
+        stubMembers(goodBatch);
 
         final IllegalStateException failure = assertThrows(IllegalStateException.class,
                 () -> service.emitDue(RUN_DATE),
-                "a failed arrival keeps the window outcome honest: emitDue reports FAILED");
+                "a failed parent keeps the window outcome honest: emitDue reports FAILED");
 
         assertTrue(failure.getMessage().contains("1 of 2"),
                 "summary names the failed/total arrival counts: " + failure.getMessage());
         assertTrue(Files.exists(root.resolve("fnbrf01/fint-req/out/FNBRF01_MSGA_PAIN008.xml")),
-                "the survivor arrival emitted despite the earlier arrival's failure");
+                "the survivor parent emitted despite the earlier parent's failure");
     }
 
-    private DueRow due(final UUID arrival, final String client, final String msgId) {
-        return new DueRow(arrival, client, msgId, 1, "E2E" + msgId + "1", new BigDecimal("10.00"));
+    /** Committed-plan batch stub: MATERIALIZED with frozen totals matching the one stubbed member. */
+    private CrwEmissionEntity stubBatch(final String outboundMsgId, final String fileName) {
+        final CrwEmissionEntity batch = mock(CrwEmissionEntity.class);
+        when(batch.getId()).thenReturn(UUID.randomUUID());
+        when(batch.getState()).thenReturn("MATERIALIZED");
+        when(batch.getBatchOrdinal()).thenReturn(1);
+        when(batch.getOutboundMsgId()).thenReturn(outboundMsgId);
+        when(batch.getFileName()).thenReturn(fileName);
+        when(batch.getTxCount()).thenReturn(1L);
+        when(batch.getControlSum()).thenReturn(new BigDecimal("10.00"));
+        return batch;
     }
 
-    private CrwEmissionEntity stubEmission(final UUID arrival, final String fileName) {
-        final CrwEmissionEntity emission = CrwEmissionEntity.planned(arrival, RUN_DATE, fileName);
-        when(emissions.findByArrivalIdAndRunDate(arrival, RUN_DATE)).thenReturn(Optional.of(emission));
-        return emission;
+    private void stubMembers(final CrwEmissionEntity batch) {
+        // read the mocked id into a local FIRST: a mock call inside thenReturn's
+        // argument list leaves the stubbing unfinished (Mockito hint 3)
+        final UUID id = batch.getId();
+        when(members.findByEmissionIdOrderBySequence(id)).thenReturn(List.of(
+                CrwEmissionMemberEntity.of(id, 1, "E2E1", new BigDecimal("10.00"))));
     }
 }

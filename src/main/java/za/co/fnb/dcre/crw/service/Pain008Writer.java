@@ -10,17 +10,20 @@ import java.util.List;
 /**
  * SYNTHETIC-CONTRACT (R-35, A-9): pain.008-shaped XML skeleton. Real bindings
  * become JAXB from the Fintegrate XSD profile when recovered (R-18); outbound
- * EndToEndId is the canonical value byte-preserved (R-15).
+ * EndToEndId is the canonical value byte-preserved (R-15). SCRUM-55: the
+ * MsgId parameter receives the batch's outbound identity (bare source MsgId
+ * unsplit, source_N for split children); the writer itself is grain-agnostic.
  */
 @Component
 public class Pain008Writer {
 
-    public List<String> build(String msgId, List<CrwEmissionMemberEntity> members, BigDecimal controlSum) {
+    public List<String> build(final String outboundMsgId, final List<CrwEmissionMemberEntity> members,
+                              final BigDecimal controlSum) {
         List<String> xml = new ArrayList<>();
         xml.add("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
         xml.add("<Document><!-- SYNTHETIC-CONTRACT pain.008 skeleton (A-9) -->");
         xml.add("  <CstmrDrctDbtInitn><GrpHdr>");
-        xml.add("    <MsgId>%s</MsgId>".formatted(msgId));
+        xml.add("    <MsgId>%s</MsgId>".formatted(outboundMsgId));
         xml.add("    <NbOfTxs>%d</NbOfTxs>".formatted(members.size()));
         xml.add("    <CtrlSum>%s</CtrlSum>".formatted(controlSum));
         xml.add("  </GrpHdr><PmtInf>");

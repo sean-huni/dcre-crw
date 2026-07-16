@@ -25,3 +25,14 @@ dcre:
   amount-scale: ${DCRE_AMOUNT_SCALE:2}
   v1-enabled: ${DCRE_V1_ENABLED:false}
   flow-dc: ${DCRE_FLOW_DC:true}
+  crw:
+    # SCRUM-55 Feature 2: parallel client-lane cap; PartitionSizer clamps it to the
+    # pod's CPU count at runtime (mirrors CTV/CRR max-partitions).
+    max-partitions: ${DCRE_CRW_MAX_PARTITIONS:5}
+    split:
+      # SCRUM-55: max tx per outbound pain.008. Default 5000 (Sean 2026-07-16).
+      # Per-client override map (add keys as dcre.crw.split.overrides.[CLIENT]: N; an
+      # inline empty {} breaks Boot map binding, so the key stays absent by default);
+      # a JobLauncher program arg --dcre.crw.split.max-size=N wins.
+      # INTERIM home until the R-14 client reference table materializes (R-39).
+      max-size: ${DCRE_CRW_MAX_SPLIT_SIZE:5000}

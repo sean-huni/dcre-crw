@@ -6,13 +6,13 @@ import org.springframework.data.repository.CrudRepository;
 import org.springframework.data.repository.query.Param;
 import za.co.fnb.dcre.crw.data.model.CrwEmissionEntity;
 import za.co.fnb.dcre.crw.data.model.DueArrivalRow;
-import za.co.fnb.dcre.crw.data.model.DueRow;
 import za.co.fnb.dcre.crw.data.model.FuturedCountRow;
 import za.co.fnb.dcre.crw.data.model.FuturedRow;
+import za.co.fnb.dcre.crw.data.model.PlanTotals;
 
+import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.List;
-import java.util.Optional;
 import java.util.UUID;
 
 public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID> {
@@ -21,10 +21,11 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
      * Arrivals with at least one transaction scheduled for the run date
      * (SCRUM-42 load fix): scalars only, one row per arrival, no per-tx
      * fanout. The 23x300k whole-backlog join blew CRDB's sql memory budget
-     * (joinreader-mem) live, so per-tx rows are fetched per arrival in
-     * {@link #findDueForArrival}. Validation is checked there too: an arrival
-     * whose due rows all failed validation lists here, fetches empty, and is
-     * skipped without a claim (same net outcome as the old joined query).
+     * (joinreader-mem) live, so per-tx work happens per arrival inside its
+     * own transaction (SplitPlanner planning queries + set-based member
+     * claims). Validation is checked there too: an arrival whose due rows
+     * all failed validation lists here, plans empty, and is skipped without
+     * a claim (same net outcome as the old joined query).
      */
     @Query(value = """
             SELECT DISTINCT s.arrival_id, h.initg_pty, h.msg_id
@@ -34,16 +35,27 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
             ORDER BY s.arrival_id""", rowMapperClass = DueArrivalRowMapper.class)
     List<DueArrivalRow> findDueArrivals(@Param("runDate") LocalDate runDate);
 
-    /** ONE arrival's transactions due on the run date (R-37): PASS verdict + schedule hits the run date. */
+    /**
+     * One client lane's due parents (SCRUM-55 Feature 2), FIFO by eligibility
+     * order: tx_header insertion order (created_at), arrival id as the
+     * deterministic tie-break (insertion order, Sean ruling 9).
+     */
     @Query(value = """
-            SELECT t.arrival_id, h.initg_pty, h.msg_id, t.sequence, t.e2e, t.amount
+            SELECT DISTINCT s.arrival_id, h.initg_pty, h.msg_id, h.created_at
             FROM cde_schedule s
-            JOIN validation_log v ON v.arrival_id = s.arrival_id AND v.sequence = s.sequence AND v.outcome = 'PASS'
-            JOIN tx_entry t ON t.arrival_id = s.arrival_id AND t.sequence = s.sequence
             JOIN tx_header h ON h.arrival_id = s.arrival_id
-            WHERE s.process_date = :runDate AND s.arrival_id = :arrivalId
-            ORDER BY t.sequence""", rowMapperClass = DueRowMapper.class)
-    List<DueRow> findDueForArrival(@Param("runDate") LocalDate runDate, @Param("arrivalId") UUID arrivalId);
+            WHERE s.process_date = :runDate AND h.initg_pty = :client
+            ORDER BY h.created_at, s.arrival_id""", rowMapperClass = DueArrivalRowMapper.class)
+    List<DueArrivalRow> findDueArrivals(@Param("runDate") LocalDate runDate, @Param("client") String client);
+
+    /** The lane universe for the partitioner: distinct clients with work due on the run date. */
+    @Query(value = """
+            SELECT DISTINCT h.initg_pty
+            FROM cde_schedule s
+            JOIN tx_header h ON h.arrival_id = s.arrival_id
+            WHERE s.process_date = :runDate
+            ORDER BY h.initg_pty""", rowMapperClass = ClientRowMapper.class)
+    List<String> findDueClients(@Param("runDate") LocalDate runDate);
 
     /**
      * Warehoused (futured) counts per (arrival, process date) group past the
@@ -59,6 +71,21 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
             ORDER BY s.arrival_id, s.process_date""", rowMapperClass = FuturedCountRowMapper.class)
     List<FuturedCountRow> findFuturedCounts(@Param("runDate") LocalDate runDate);
 
+    /**
+     * Client-scoped futured counts for a lane run (SCRUM-55 Feature 2): each
+     * lane warns only its own client's warehoused rows so parallel lanes never
+     * duplicate an R-38 WARN.
+     */
+    @Query(value = """
+            SELECT s.arrival_id, s.process_date, count(*) AS futured
+            FROM cde_schedule s
+            JOIN tx_header h ON h.arrival_id = s.arrival_id
+            JOIN validation_log v ON v.arrival_id = s.arrival_id AND v.sequence = s.sequence AND v.outcome = 'PASS'
+            WHERE s.process_date > :runDate AND h.initg_pty = :client
+            GROUP BY s.arrival_id, s.process_date
+            ORDER BY s.arrival_id, s.process_date""", rowMapperClass = FuturedCountRowMapper.class)
+    List<FuturedCountRow> findFuturedCounts(@Param("runDate") LocalDate runDate, @Param("client") String client);
+
     /** ONE (arrival, process date) group's warehoused rows, for per-tx R-38 WARN detail on small groups. */
     @Query(value = """
             SELECT t.arrival_id, t.sequence, t.e2e, s.process_date
@@ -70,17 +97,77 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
     List<FuturedRow> findFuturedForArrival(@Param("arrivalId") UUID arrivalId,
                                            @Param("processDate") LocalDate processDate);
 
-    /** Snapshot claim (R-24): first writer wins; a restart sees empty and reuses the existing snapshot. */
+    /**
+     * Whole-parent totals for the frozen plan (SCRUM-55): executes inside the
+     * caller's arrival transaction, so totals, boundaries and member claims
+     * share one CRDB snapshot and the due-set cannot shift mid-plan.
+     */
+    @Query(value = """
+            SELECT count(*) AS total_tx, COALESCE(sum(t.amount), 0) AS total_amount
+            FROM cde_schedule s
+            JOIN validation_log v ON v.arrival_id = s.arrival_id AND v.sequence = s.sequence AND v.outcome = 'PASS'
+            JOIN tx_entry t ON t.arrival_id = s.arrival_id AND t.sequence = s.sequence
+            WHERE s.process_date = :runDate AND s.arrival_id = :arrivalId""",
+            rowMapperClass = PlanTotalsRowMapper.class)
+    PlanTotals planTotals(@Param("runDate") LocalDate runDate, @Param("arrivalId") UUID arrivalId);
+
+    /** Ordinal-th boundary sequences: the eligible rows ranked by original sequence, every maxSize-th. */
+    @Query(value = """
+            SELECT sequence FROM (
+                SELECT t.sequence, row_number() OVER (ORDER BY t.sequence) AS rn
+                FROM cde_schedule s
+                JOIN validation_log v ON v.arrival_id = s.arrival_id AND v.sequence = s.sequence AND v.outcome = 'PASS'
+                JOIN tx_entry t ON t.arrival_id = s.arrival_id AND t.sequence = s.sequence
+                WHERE s.process_date = :runDate AND s.arrival_id = :arrivalId) AS ranked
+            WHERE rn % :maxSize = 0 ORDER BY sequence""", rowMapperClass = SequenceRowMapper.class)
+    List<Integer> batchBoundaries(@Param("runDate") LocalDate runDate, @Param("arrivalId") UUID arrivalId,
+                                  @Param("maxSize") int maxSize);
+
+    /** Freezes the batch's member totals at plan time; R-24 reconciles each file against its OWN frozen values. */
+    @Modifying
+    @Query("UPDATE crw_emission SET tx_count = :c, control_sum = :s, updated_at = now() WHERE id = :id")
+    void freezeTotals(@Param("id") UUID id, @Param("c") long c, @Param("s") BigDecimal s);
+
+    /**
+     * Batches already claimed for the parent on OTHER run dates (SCRUM-55
+     * review fix): the outbound artifact sequence continues across run dates
+     * (a matured-warehoused re-emission is a NEW physical artifact), so bare
+     * MsgId and _N identities never repeat within a parent. Runs inside the
+     * arrival transaction; committed prior plans are immutable, so the offset
+     * is stable for every replay of this (arrival, run_date). crw-5 residual:
+     * this count executes in the SAME plan-tx snapshot as the batch selection
+     * the caller publishes from, and it is trustworthy ONLY because files are
+     * published strictly AFTER their rows commit (durable-effect ordering):
+     * committed rows are therefore the COMPLETE artifact registry. Never call
+     * this at publication time to (re)derive names; publication uses the
+     * stored outbound_msg_id/file_name of the selected unpublished rows.
+     */
+    @Query("SELECT count(*) FROM crw_emission WHERE arrival_id = :arrivalId AND run_date <> :runDate")
+    long countPriorArtifacts(@Param("arrivalId") UUID arrivalId, @Param("runDate") LocalDate runDate);
+
+    /**
+     * Snapshot claim (R-24) at batch grain (SCRUM-55): first writer wins on the
+     * FULL identity (arrival_id, run_date, batch_ordinal); a restart no-ops and
+     * reuses the existing batch row.
+     */
     @Modifying
     @Query("""
-            INSERT INTO crw_emission (id, arrival_id, run_date, file_name, state)
-            VALUES (:#{#e.id}, :#{#e.arrivalId}, :#{#e.runDate}, :#{#e.fileName}, :#{#e.state})
-            ON CONFLICT (arrival_id, run_date) DO NOTHING""")
+            INSERT INTO crw_emission (id, group_id, arrival_id, run_date, batch_ordinal,
+                                      outbound_msg_id, file_name, state)
+            VALUES (:#{#e.id}, :#{#e.groupId}, :#{#e.arrivalId}, :#{#e.runDate}, :#{#e.batchOrdinal},
+                    :#{#e.outboundMsgId}, :#{#e.fileName}, :#{#e.state})
+            ON CONFLICT (arrival_id, run_date, batch_ordinal) DO NOTHING""")
     void claimSnapshot(@Param("e") CrwEmissionEntity e);
 
-    Optional<CrwEmissionEntity> findByArrivalIdAndRunDate(UUID arrivalId, LocalDate runDate);
+    List<CrwEmissionEntity> findByArrivalIdAndRunDateOrderByBatchOrdinal(UUID arrivalId, LocalDate runDate);
 
     @Modifying
     @Query("UPDATE crw_emission SET state = :state, updated_at = now() WHERE id = :id AND state <> :state")
     void transition(@Param("id") UUID id, @Param("state") String state);
+
+    /** Ordinal publication (SCRUM-55): the atomic VISIBLE move stamps visible_at for SLA timers. */
+    @Modifying
+    @Query("UPDATE crw_emission SET state = 'VISIBLE', visible_at = now(), updated_at = now()"
+            + " WHERE id = :id AND state <> 'VISIBLE'")
+    void markVisible(@Param("id") UUID id);
 }

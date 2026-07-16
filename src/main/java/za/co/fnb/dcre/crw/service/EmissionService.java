@@ -9,7 +9,6 @@ import org.springframework.transaction.support.TransactionTemplate;
 import za.co.fnb.dcre.crw.data.model.CrwEmissionEntity;
 import za.co.fnb.dcre.crw.data.model.CrwEmissionMemberEntity;
 import za.co.fnb.dcre.crw.data.model.DueArrivalRow;
-import za.co.fnb.dcre.crw.data.model.DueRow;
 import za.co.fnb.dcre.crw.data.model.FuturedCountRow;
 import za.co.fnb.dcre.crw.data.model.FuturedRow;
 import za.co.fnb.dcre.crw.data.repo.CrwEmissionMemberRepo;
@@ -21,17 +20,20 @@ import za.co.fnb.dcre.platform.files.StagedWrite;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.math.BigDecimal;
+import java.nio.file.Path;
 import java.time.LocalDate;
 import java.util.List;
-import java.util.UUID;
 
 /**
- * Business tier: the R-37 Process-Date Executor. Emits pain.008 ONLY for
- * transactions whose process_date equals the run date; futured work stays
- * warehoused. Snapshot-first per R-24: membership is claimed immutably
- * BEFORE any file is built, so a restart reuses the identical member set
- * even when the schedule has moved on. StagedWrite = restart no-op (R-05).
+ * Business tier: the R-37 Process-Date Executor at batch grain (SCRUM-55).
+ * Each due parent runs TWO durability phases (review fix, durable-effect
+ * ordering): the plan transaction commits group, batches, frozen members and
+ * totals (MATERIALIZED) BEFORE any file exists; publication then walks the
+ * committed batches strictly in ordinal order (_2 never VISIBLE before _1),
+ * per batch StagedWrite then markVisible in its own small transaction.
+ * Restart keys are per batch (arrival, run_date, ordinal) plus the
+ * file-existence no-op (R-05); each file reconciles against its OWN frozen
+ * tx_count before building (R-24 frozen-plan integrity).
  */
 @Service
 public class EmissionService {
@@ -45,44 +47,67 @@ public class EmissionService {
     private final CrwEmissionMemberRepo members;
     private final Pain008Writer painWriter;
     private final ExchangeLayout layout;
-    private final TransactionTemplate arrivalTx;
+    private final SplitPlanner planner;
+    private final TransactionTemplate requiresNewTx;
 
     public EmissionService(final CrwEmissionRepo emissions, final CrwEmissionMemberRepo members,
                            final Pain008Writer painWriter, final ExchangeLayout layout,
-                           final PlatformTransactionManager txManager) {
+                           final SplitPlanner planner, final PlatformTransactionManager txManager) {
         this.emissions = emissions;
         this.members = members;
         this.painWriter = painWriter;
         this.layout = layout;
+        this.planner = planner;
         // SCRUM-42 load fix: each arrival commits in its OWN transaction so a
         // 300k-tx window ratchets progress arrival by arrival; and a CRDB 40001
         // abort poisons the surrounding transaction (25P02 on any further
-        // statement), so a retry needs a fresh transaction per attempt.
-        this.arrivalTx = new TransactionTemplate(txManager);
-        this.arrivalTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
+        // statement), so a retry needs a fresh transaction per attempt. The
+        // same template serves BOTH the plan transaction and each per-batch
+        // publication transaction (SCRUM-55 durable-effect ordering).
+        this.requiresNewTx = new TransactionTemplate(txManager);
+        this.requiresNewTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
     }
 
     /**
      * Step-transaction reads are arrival-level scalars ONLY (futured count
      * aggregates + due-arrival listing): the 23x300k whole-backlog per-tx
      * join blew CRDB's sql memory budget (joinreader-mem) live. Every arrival
-     * then commits in its own REQUIRES_NEW transaction so one failure never
+     * then plans in its own REQUIRES_NEW transaction so one failure never
      * rolls back sibling emissions. A failed arrival is logged and skipped;
-     * the window still reports FAILED at the end (the next window re-picks
-     * exactly the unclaimed arrivals).
+     * the window still reports FAILED at the end (the next window resumes
+     * exactly the unplanned arrivals and unpublished batches). Whole-run
+     * variant, kept as the direct entry point for tests and manual runs; the
+     * job goes through the client-scoped overload per lane (SCRUM-55
+     * Feature 2).
      *
-     * @return number of pain.008 files emitted for the run date.
+     * @return number of pain.008 FILES emitted for the run date (batch grain).
      */
     public int emitDue(final LocalDate runDate) {
-        warnFutured(runDate);
-        List<DueArrivalRow> arrivals = emissions.findDueArrivals(runDate);
+        warnFutured(emissions.findFuturedCounts(runDate));
+        return emitAll(emissions.findDueArrivals(runDate), runDate);
+    }
+
+    /**
+     * One client lane's slice of the run (SCRUM-55 Feature 2): FIFO within
+     * the client = eligibility order (tx_header insertion order). Futured
+     * WARNs are client-scoped so parallel lanes never duplicate them.
+     */
+    public int emitDue(final LocalDate runDate, final String client) {
+        warnFutured(emissions.findFuturedCounts(runDate, client));
+        return emitAll(emissions.findDueArrivals(runDate, client), runDate);
+    }
+
+    /** Lane universe for the partitioner: distinct clients with work due on the run date. */
+    public List<String> dueClients(final LocalDate runDate) {
+        return emissions.findDueClients(runDate);
+    }
+
+    private int emitAll(final List<DueArrivalRow> arrivals, final LocalDate runDate) {
         int emitted = 0;
         int failed = 0;
-        for (DueArrivalRow arrival : arrivals) {
+        for (final DueArrivalRow arrival : arrivals) {
             try {
-                if (emitArrival(arrival, runDate)) {
-                    emitted++;
-                }
+                emitted += emitArrival(arrival, runDate);
             } catch (final RuntimeException e) {
                 failed++;
                 log.error("emission failed stage=CRW arrival={} runDate={}", arrival.arrivalId(), runDate, e);
@@ -103,72 +128,100 @@ public class EmissionService {
      * memory problem; seq=-1 e2e=- follows the ALREADY_VISIBLE file-level
      * WARN precedent).
      */
-    private void warnFutured(final LocalDate runDate) {
-        for (FuturedCountRow group : emissions.findFuturedCounts(runDate)) {
+    private void warnFutured(final List<FuturedCountRow> groups) {
+        for (final FuturedCountRow group : groups) {
             if (group.futured() > FUTURED_DETAIL_WARN_LIMIT) {
                 log.warn("excluded stage=CRW arrival={} seq=-1 e2e=- count={} reason=FUTURED_{}",
                         group.arrivalId(), group.futured(), group.processDate());
                 continue;
             }
-            for (FuturedRow futured : emissions.findFuturedForArrival(group.arrivalId(), group.processDate())) {
+            for (final FuturedRow futured : emissions.findFuturedForArrival(group.arrivalId(), group.processDate())) {
                 log.warn("excluded stage=CRW arrival={} seq={} e2e={} reason=FUTURED_{}",
                         futured.arrivalId(), futured.sequence(), futured.e2e(), futured.processDate());
             }
         }
     }
 
-    /** One arrival = one committed unit: fresh REQUIRES_NEW tx per bounded-retry attempt. */
-    private boolean emitArrival(final DueArrivalRow arrival, final LocalDate runDate) {
-        return CrdbRetry.run("emit arrival=%s".formatted(arrival.arrivalId()), () ->
-                Boolean.TRUE.equals(arrivalTx.execute(status -> {
+    /**
+     * One parent, two durability phases. Phase 1 (fresh REQUIRES_NEW tx per
+     * bounded-retry attempt) commits the WHOLE plan: group, batches, frozen
+     * members and totals, MATERIALIZED. NO file leaves phase 1: a file
+     * published before its plan commits can be consumed by Fintegrate while
+     * a crash rolls the plan back, and a legitimately shifted replan (CDE
+     * re-ran) would orphan that file's identity. Phase 2 publishes strictly
+     * in ordinal order; after a kill between plan commit and publication the
+     * resume publishes exactly the unpublished ordinals of the SAME plan.
+     * The batch rows returned by phase 1 carry state AND frozen identity
+     * from the one snapshot that also computed the prior-artifact offset
+     * (crw-5): publication decides "unpublished" and names files from those
+     * rows only, never from a separate committed-rows-at-large read.
+     */
+    private int emitArrival(final DueArrivalRow arrival, final LocalDate runDate) {
+        final List<CrwEmissionEntity> batches = CrdbRetry.run("plan arrival=%s".formatted(arrival.arrivalId()),
+                () -> requiresNewTx.execute(status -> planner.planAndClaim(arrival, runDate)));
+        if (batches == null || batches.isEmpty()) {
+            return 0;
+        }
+        int emitted = 0;
+        for (final CrwEmissionEntity batch : batches) {
+            if ("VISIBLE".equals(batch.getState())) {
+                // Already handed to Fintegrate: a later window MUST NOT re-emit
+                // this batch. R-38: single file-level WARN per batch.
+                log.warn("excluded stage=CRW arrival={} seq=-1 e2e=- reason=ALREADY_VISIBLE batch={}",
+                        arrival.arrivalId(), batch.getBatchOrdinal());
+                continue;
+            }
+            publishBatch(arrival, batch);
+            emitted++;
+        }
+        return emitted;
+    }
+
+    /**
+     * Publishes ONE committed batch: StagedWrite then markVisible inside a
+     * small REQUIRES_NEW transaction per bounded-retry attempt. The XML
+     * builds strictly from the immutable member snapshot, never the live
+     * selection (R-24), and reconciles against the batch's OWN frozen
+     * tx_count; identity (outbound MsgId, file name) comes ONLY from the
+     * stored row. A replay is a per-batch file-existence StagedWrite no-op
+     * (R-05) and markVisible is state-guarded, so a crash anywhere in this
+     * method resumes cleanly.
+     */
+    private void publishBatch(final DueArrivalRow arrival, final CrwEmissionEntity batch) {
+        CrdbRetry.run("publish arrival=%s batch=%d".formatted(arrival.arrivalId(), batch.getBatchOrdinal()),
+                () -> requiresNewTx.execute(status -> {
+                    List<CrwEmissionMemberEntity> snapshot = members.findByEmissionIdOrderBySequence(batch.getId());
+                    if (batch.getTxCount() == null || snapshot.size() != batch.getTxCount()) {
+                        throw new IllegalStateException(
+                                "frozen-plan mismatch stage=CRW arrival=%s batch=%d members=%d expected=%s"
+                                        .formatted(arrival.arrivalId(), batch.getBatchOrdinal(), snapshot.size(),
+                                                batch.getTxCount()));
+                    }
+                    List<String> xml = painWriter.build(batch.getOutboundMsgId(), snapshot, batch.getControlSum());
+                    // SCRUM-42: per-client fint-req/out leaf. An unconfigured client fails closed here (resolve throws).
+                    Path target = layout.resolve(arrival.client(), ExchangeChannel.FINT_REQ, ExchangeSub.OUT)
+                            .resolve(batch.getFileName());
                     try {
-                        return emitOne(arrival, runDate);
+                        StagedWrite.write(target, xml);      // per-batch file-existence restart no-op (R-05)
                     } catch (final IOException e) {
                         throw new UncheckedIOException(e);
                     }
-                })));
+                    afterStagedWrite(batch);                 // crash-matrix quadrant-4 seam (production no-op)
+                    emissions.markVisible(batch.getId());    // stamps visible_at for the SLA timer
+                    return null;
+                }));
     }
 
-    private boolean emitOne(final DueArrivalRow arrival, final LocalDate runDate) throws IOException {
-        UUID arrivalId = arrival.arrivalId();
-        // This arrival's due rows, read INSIDE its own transaction: bounded by
-        // one arrival's size (300k max) instead of the whole backlog.
-        List<DueRow> due = emissions.findDueForArrival(runDate, arrivalId);
-        if (due.isEmpty()) {
-            // Every due row failed validation (or drifted away): nothing to
-            // emit, no claim taken, a later window re-evaluates this arrival.
-            return false;
-        }
-        String client = arrival.client();
-        String msgId = arrival.msgId();
-        String fileName = client + "_" + msgId + "_PAIN008.xml";
-
-        CrwEmissionEntity candidate = CrwEmissionEntity.planned(arrivalId, runDate, fileName);
-        emissions.claimSnapshot(candidate);
-        CrwEmissionEntity emission = emissions.findByArrivalIdAndRunDate(arrivalId, runDate).orElseThrow();
-        if ("VISIBLE".equals(emission.getState())) {
-            // Already handed to Fintegrate by an earlier window of this run date:
-            // a later window MUST NOT re-emit (duplicate collection order). Restart
-            // rebuilds still happen below while the state is pre-VISIBLE.
-            // R-38: single file-level WARN (no per-tx identity at file scope).
-            log.warn("excluded stage=CRW arrival={} seq=-1 e2e=- reason=ALREADY_VISIBLE", arrivalId);
-            return false;
-        }
-        if ("PLANNED".equals(emission.getState())) {
-            for (DueRow row : due) {
-                members.addMember(CrwEmissionMemberEntity.of(emission.getId(), row.sequence(),
-                        row.e2e(), row.amount()));
-            }
-            emissions.transition(emission.getId(), "MATERIALIZED");
-        }
-        // Build strictly from the immutable snapshot, never the live selection (R-24).
-        List<CrwEmissionMemberEntity> snapshot = members.findByEmissionIdOrderBySequence(emission.getId());
-        BigDecimal controlSum = snapshot.stream().map(CrwEmissionMemberEntity::getAmount)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
-        List<String> xml = painWriter.build(msgId, snapshot, controlSum);
-        // SCRUM-42: per-client fint-req/out leaf. An unconfigured client fails closed here (resolve throws).
-        StagedWrite.write(layout.resolve(client, ExchangeChannel.FINT_REQ, ExchangeSub.OUT).resolve(fileName), xml);
-        emissions.transition(emission.getId(), "VISIBLE");
-        return true;
+    /**
+     * Crash-matrix quadrant-4 seam: runs after StagedWrite has landed the
+     * batch file and before markVisible commits. File writes are not
+     * transactional, so a kill in this gap leaves the file durable on disk
+     * while the publication transaction rolls back with the row still
+     * MATERIALIZED; the resume must hit the R-05 file-existence no-op, never
+     * a rewrite. Production no-op, package-private so the crash-matrix IT
+     * can inject the kill exactly here.
+     */
+    void afterStagedWrite(final CrwEmissionEntity batch) {
+        // production no-op: crash-matrix test seam (quadrant 4)
     }
 }

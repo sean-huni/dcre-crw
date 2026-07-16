@@ -57,7 +57,8 @@ class CrwJobTest {
 
     void seed(UUID arrival, String client, String msgId, int total, String dueDate, String futureDate) {
         jdbc.execute("CREATE TABLE IF NOT EXISTS tx_header (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
-                + " arrival_id UUID UNIQUE, msg_id VARCHAR(35), initg_pty VARCHAR(35))");
+                + " arrival_id UUID UNIQUE, msg_id VARCHAR(35), initg_pty VARCHAR(35),"
+                + " created_at TIMESTAMPTZ NOT NULL DEFAULT now())");
         jdbc.execute("CREATE TABLE IF NOT EXISTS tx_entry (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
                 + " arrival_id UUID, sequence INT, e2e VARCHAR(35), amount DECIMAL(18,2), UNIQUE (arrival_id, sequence))");
         jdbc.execute("CREATE TABLE IF NOT EXISTS validation_log (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
@@ -139,8 +140,8 @@ class CrwJobTest {
                         .filter(e -> e.getLevel() == Level.WARN)
                         .map(ILoggingEvent::getFormattedMessage)
                         .anyMatch(m -> m.equals("excluded stage=CRW arrival=" + arrival
-                                + " seq=-1 e2e=- reason=ALREADY_VISIBLE")),
-                "file-level ALREADY_VISIBLE WARN (R-38 exclusion visibility)");
+                                + " seq=-1 e2e=- reason=ALREADY_VISIBLE batch=1")),
+                "file-level ALREADY_VISIBLE WARN (R-38 exclusion visibility, SCRUM-55 batch grain)");
         emissionLogger.detachAppender(warns);
     }
 
@@ -169,10 +170,12 @@ class CrwJobTest {
         Path file = Path.of("build/test-exchange/fnbrf01/fint-req/out", "FNBRF01_" + goodMsg + "_PAIN008.xml");
         assertTrue(Files.readAllLines(file).stream().anyMatch(l -> l.contains("<NbOfTxs>1</NbOfTxs>")),
                 "good arrival's pain.008 written and handed over");
-        // The failed arrival left NO claim: the next window re-picks exactly it.
-        assertEquals(0, (int) jdbc.queryForObject(
-                        "SELECT count(*) FROM crw_emission WHERE arrival_id = ?", Integer.class, bad),
-                "failed arrival's claim rolled back so a later window re-picks it");
+        // SCRUM-55 durable-effect ordering: the failed arrival's PLAN is committed
+        // (MATERIALIZED) but nothing was published: no file, no VISIBLE state. The
+        // next window resumes exactly the unpublished batches of the SAME plan.
+        assertEquals("MATERIALIZED", jdbc.queryForObject(
+                        "SELECT state FROM crw_emission WHERE arrival_id = ?", String.class, bad),
+                "failed arrival's plan is durable yet unpublished; a later window resumes it");
     }
 
     @Test
