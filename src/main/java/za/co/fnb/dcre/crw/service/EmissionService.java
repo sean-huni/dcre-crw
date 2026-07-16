@@ -206,8 +206,22 @@ public class EmissionService {
                     } catch (final IOException e) {
                         throw new UncheckedIOException(e);
                     }
+                    afterStagedWrite(batch);                 // crash-matrix quadrant-4 seam (production no-op)
                     emissions.markVisible(batch.getId());    // stamps visible_at for the SLA timer
                     return null;
                 }));
+    }
+
+    /**
+     * Crash-matrix quadrant-4 seam: runs after StagedWrite has landed the
+     * batch file and before markVisible commits. File writes are not
+     * transactional, so a kill in this gap leaves the file durable on disk
+     * while the publication transaction rolls back with the row still
+     * MATERIALIZED; the resume must hit the R-05 file-existence no-op, never
+     * a rewrite. Production no-op, package-private so the crash-matrix IT
+     * can inject the kill exactly here.
+     */
+    void afterStagedWrite(final CrwEmissionEntity batch) {
+        // production no-op: crash-matrix test seam (quadrant 4)
     }
 }

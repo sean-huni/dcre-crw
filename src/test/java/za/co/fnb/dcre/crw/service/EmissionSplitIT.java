@@ -20,10 +20,12 @@ import za.co.fnb.dcre.platform.files.ExchangeSub;
 import java.math.BigDecimal;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
 import java.time.LocalDate;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -51,6 +53,9 @@ class EmissionSplitIT extends CrwTestcontainersBase {
     ExchangeLayout layout;
 
     @Autowired
+    Pain008Writer painWriter;
+
+    @Autowired
     PlatformTransactionManager txManager;
 
     private Path out() {
@@ -59,6 +64,11 @@ class EmissionSplitIT extends CrwTestcontainersBase {
 
     private long memberTotalAcrossBatches(final UUID arrivalId) {
         return jdbc.queryForObject("SELECT count(*) FROM crw_emission_member m"
+                + " JOIN crw_emission e ON e.id = m.emission_id WHERE e.arrival_id = ?", Long.class, arrivalId);
+    }
+
+    private long distinctMemberSequences(final UUID arrivalId) {
+        return jdbc.queryForObject("SELECT count(DISTINCT m.sequence) FROM crw_emission_member m"
                 + " JOIN crw_emission e ON e.id = m.emission_id WHERE e.arrival_id = ?", Long.class, arrivalId);
     }
 
@@ -187,6 +197,59 @@ class EmissionSplitIT extends CrwTestcontainersBase {
         assertThat(memberTotalAcrossBatches(arrivalId)).isEqualTo(12001L); // no member drift
     }
 
+    /**
+     * Crash-matrix quadrant 4 (review MAJOR): kill AFTER StagedWrite lands a
+     * batch file but BEFORE markVisible commits. File writes are not
+     * transactional, so this gap leaves the file durable on disk while the
+     * publication transaction rolls back with the emission row still
+     * MATERIALIZED. The resume must treat the landed file as a completed
+     * write (R-05 restart no-op): byte-identical, never rewritten, marked
+     * VISIBLE, remaining ordinals published, zero member drift.
+     */
+    @Test
+    void killAfterFileLandedBeforeMarkVisibleResumesWithoutRewritingTheLandedFile() throws Exception {
+        UUID arrivalId = UUID.randomUUID();
+        LocalDate runDate = LocalDate.of(2026, 8, 9);
+        // Per-run msgId (plan-commit seam test shape): build/test-exchange
+        // survives between gradle runs, and this test asserts mid-flow file
+        // ABSENCE plus an exact artifact census for the parent.
+        String msgId = "DCRERFQ4" + arrivalId.toString().substring(0, 8);
+        seedDueArrival(arrivalId, "FNBRF01", msgId, 12001, runDate);
+        KillAfterFileLandedService killable =
+                new KillAfterFileLandedService(emissions, members, painWriter, layout, planner, txManager);
+        killable.arm();
+
+        assertThatThrownBy(() -> killable.emitDue(runDate)).isInstanceOf(IllegalStateException.class);
+
+        // Quadrant-4 state manufactured: batch 1's file landed, its row never reached VISIBLE.
+        var planned = emissions.findByArrivalIdAndRunDateOrderByBatchOrdinal(arrivalId, runDate);
+        assertThat(planned).hasSize(3);
+        assertThat(planned).extracting(CrwEmissionEntity::getState).containsOnly("MATERIALIZED");
+        Path landed = out().resolve(planned.get(0).getFileName());
+        assertThat(landed).exists();
+        assertThat(out().resolve(planned.get(1).getFileName())).doesNotExist();
+        assertThat(out().resolve(planned.get(2).getFileName())).doesNotExist();
+        byte[] before = Files.readAllBytes(landed);
+        FileTime mtimeBefore = Files.getLastModifiedTime(landed);
+
+        killable.heal();
+        assertThat(killable.emitDue(runDate)).isEqualTo(3); // batch 1 resumes as no-op write + markVisible
+
+        assertThat(Files.readAllBytes(landed)).isEqualTo(before);             // byte-identical, never rewritten
+        assertThat(Files.getLastModifiedTime(landed)).isEqualTo(mtimeBefore); // not even touched
+        var resumed = emissions.findByArrivalIdAndRunDateOrderByBatchOrdinal(arrivalId, runDate);
+        assertThat(resumed).extracting(CrwEmissionEntity::getState).containsOnly("VISIBLE");
+        assertThat(resumed.get(0).getVisibleAt()).isNotNull();
+        // exactly the 3 planned artifacts for this parent: no duplicates, no .tmp leftovers
+        try (Stream<Path> files = Files.list(out())) {
+            assertThat(files.map(p -> p.getFileName().toString()).filter(n -> n.contains(msgId)))
+                    .containsExactlyInAnyOrder(planned.get(0).getFileName(),
+                            planned.get(1).getFileName(), planned.get(2).getFileName());
+        }
+        assertThat(memberTotalAcrossBatches(arrivalId)).isEqualTo(12001L);    // zero member drift
+        assertThat(distinctMemberSequences(arrivalId)).isEqualTo(12001L);     // no cross-batch duplication
+    }
+
     @Test
     void alreadyVisibleParentIsAPerParentNoOpWarn() {
         UUID arrivalId = UUID.randomUUID();
@@ -208,6 +271,41 @@ class EmissionSplitIT extends CrwTestcontainersBase {
                 .filter(e -> e.getLevel() == Level.WARN)
                 .map(ILoggingEvent::getFormattedMessage))
                 .contains("excluded stage=CRW arrival=" + arrivalId + " seq=-1 e2e=- reason=ALREADY_VISIBLE batch=1");
+    }
+
+    /**
+     * Quadrant-4 kill switch: overrides the package-private production seam
+     * that runs after StagedWrite lands a batch file and before markVisible,
+     * so the test crashes exactly in that gap. Everything else is the real
+     * EmissionService against real beans. The FlakyPain008Writer harness
+     * cannot reach this state: it fails during build, BEFORE the file lands.
+     */
+    static final class KillAfterFileLandedService extends EmissionService {
+
+        private volatile boolean armed;
+
+        KillAfterFileLandedService(final CrwEmissionRepo emissions, final CrwEmissionMemberRepo members,
+                                   final Pain008Writer painWriter, final ExchangeLayout layout,
+                                   final SplitPlanner planner, final PlatformTransactionManager txManager) {
+            super(emissions, members, painWriter, layout, planner, txManager);
+        }
+
+        void arm() {
+            armed = true;
+        }
+
+        void heal() {
+            armed = false;
+        }
+
+        @Override
+        void afterStagedWrite(final CrwEmissionEntity batch) {
+            if (armed) {
+                throw new IllegalStateException(
+                        "simulated kill: file landed for batch %d, markVisible never committed"
+                                .formatted(batch.getBatchOrdinal()));
+            }
+        }
     }
 
     /** Delegates to the real writer; while failing, every build past the threshold throws (0 = all). */
