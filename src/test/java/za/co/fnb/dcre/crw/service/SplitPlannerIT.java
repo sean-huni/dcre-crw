@@ -94,6 +94,33 @@ class SplitPlannerIT extends CrwTestcontainersBase {
         assertThat(batches.get(0).getFileName()).isEqualTo("FNBRF01_DCRERF2026071600000002_PAIN008.xml");
     }
 
+    /**
+     * Cross-run-date identity ruling (SCRUM-55 review BLOCKER fix): a
+     * re-emission of the same parent on a later run date continues the
+     * parent's outbound artifact sequence (_4 after _1.._3), keeping every
+     * outbound_msg_id and filename unique across the FULL identity
+     * (arrival_id, run_date, batch_ordinal) while the restart key
+     * batch_ordinal still restarts at 1 per run date.
+     */
+    @Test
+    void reEmissionOnALaterRunDateContinuesTheArtifactSequence() {
+        msgId = "DCRERF2026071600000004";
+        LocalDate dayTwo = RUN_DATE.plusDays(4);
+        seedTwoDateArrival(arrivalId, "FNBRF01", msgId, 12001, 2, RUN_DATE, dayTwo);
+
+        var dayOne = txTemplate.execute(s -> planner.planAndClaim(dueArrival(), RUN_DATE));
+        assertThat(dayOne).extracting(CrwEmissionEntity::getOutboundMsgId)
+                .containsExactly(msgId + "_1", msgId + "_2", msgId + "_3");
+
+        var dayTwoBatches = txTemplate.execute(s -> planner.planAndClaim(dueArrival(), dayTwo));
+
+        assertThat(dayTwoBatches).hasSize(1);
+        assertThat(dayTwoBatches.get(0).getBatchOrdinal()).isEqualTo(1);       // restart key per run date
+        assertThat(dayTwoBatches.get(0).getOutboundMsgId()).isEqualTo(msgId + "_4");
+        assertThat(dayTwoBatches.get(0).getFileName()).isEqualTo("FNBRF01_" + msgId + "_4_PAIN008.xml");
+        assertThat(memberCount(dayTwoBatches.get(0))).isEqualTo(2);
+    }
+
     @Test
     void configChangePlusRestartNeverRepartitions() {
         msgId = "DCRERF2026071600000003";

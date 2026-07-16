@@ -65,4 +65,27 @@ public abstract class CrwTestcontainersBase {
                 + " SELECT ?, i, ? FROM generate_series(1, ?) AS g(i)"
                 + " ON CONFLICT (arrival_id, sequence) DO NOTHING", arrival, runDate, total);
     }
+
+    /**
+     * Two-date warehousing fixture (R-37, the canonical CrwJobTest.seed shape
+     * at set-based scale): sequences 1..dueNow are due on dayOne; the
+     * remaining futured sequences mature on dayTwo, so the SAME arrival
+     * legitimately becomes due AGAIN on the later run date. Regression
+     * fixture for the cross-run-date outbound-identity collision
+     * (SCRUM-55 review fix, idempotency-key completeness).
+     */
+    protected void seedTwoDateArrival(final UUID arrival, final String client, final String msgId,
+            final int dueNow, final int futured, final LocalDate dayOne, final LocalDate dayTwo) {
+        seedDueArrival(arrival, client, msgId, dueNow, dayOne);
+        final int total = dueNow + futured;
+        jdbc.update("INSERT INTO tx_entry (arrival_id, sequence, e2e, amount)"
+                + " SELECT ?, i, 'E2E' || i::STRING, 10.00 FROM generate_series(? + 1, ?) AS g(i)"
+                + " ON CONFLICT (arrival_id, sequence) DO NOTHING", arrival, dueNow, total);
+        jdbc.update("INSERT INTO validation_log (arrival_id, sequence, outcome)"
+                + " SELECT ?, i, 'PASS' FROM generate_series(? + 1, ?) AS g(i)"
+                + " ON CONFLICT (arrival_id, sequence) DO NOTHING", arrival, dueNow, total);
+        jdbc.update("INSERT INTO cde_schedule (arrival_id, sequence, process_date)"
+                + " SELECT ?, i, ? FROM generate_series(? + 1, ?) AS g(i)"
+                + " ON CONFLICT (arrival_id, sequence) DO NOTHING", arrival, dayTwo, dueNow, total);
+    }
 }

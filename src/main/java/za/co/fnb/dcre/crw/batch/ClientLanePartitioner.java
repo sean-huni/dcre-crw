@@ -11,7 +11,12 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * SCRUM-55 Feature 2: one partition per client lane, keyed client=&lt;token&gt;.
+ * SCRUM-55 Feature 2: one partition per client lane, keyed by BOUNDED index
+ * (lane-N). Worker executions persist as emitWorkerStep:&lt;key&gt; into
+ * CRW_BATCH_STEP_EXECUTION.STEP_NAME (VARCHAR(100)), so the unbounded client
+ * tokens must never ride in the key (review fix: 3+ VARCHAR(35) clients in
+ * one lane overflowed the column at runtime); the comma-joined client list
+ * travels in the lane's ExecutionContext (SHORT_CONTEXT VARCHAR(2500)).
  * gridSize arrives as PartitionSizer.partitions(maxPartitions) = min(pod
  * CPUs, DCRE_CRW_MAX_PARTITIONS) and is a REAL concurrency cap: the partition
  * handler runs every returned partition concurrently on virtual threads, so
@@ -44,11 +49,10 @@ public class ClientLanePartitioner implements Partitioner {
         for (int i = 0; i < clients.size(); i++) {
             buckets.get(i % lanes).add(clients.get(i));
         }
-        for (final List<String> bucket : buckets) {
-            final String token = String.join(",", bucket);
+        for (int lane = 0; lane < buckets.size(); lane++) {
             final ExecutionContext context = new ExecutionContext();
-            context.putString("client", token);
-            partitions.put("client=" + token, context);
+            context.putString("clients", String.join(",", buckets.get(lane)));
+            partitions.put("lane-" + lane, context);
         }
         return partitions;
     }

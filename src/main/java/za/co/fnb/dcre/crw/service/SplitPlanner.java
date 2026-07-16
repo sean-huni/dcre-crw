@@ -60,15 +60,31 @@ public class SplitPlanner {
         return emissions.findByArrivalIdAndRunDateOrderByBatchOrdinal(arrivalId, runDate);
     }
 
+    /**
+     * Cross-run-date identity ruling (SCRUM-55 review BLOCKER fix): the
+     * outbound identity enumerates the parent's PHYSICAL ARTIFACTS across
+     * ALL run dates. The parent's first plan keeps the ratified rules
+     * exactly (unsplit = bare source MsgId, split = _1.._N); a re-emission
+     * (warehoused rows maturing on a later run date) continues the artifact
+     * sequence and is ALWAYS suffixed: reusing the bare MsgId or a prior
+     * ordinal would be a duplicate MsgId on the wire or a StagedWrite
+     * restart no-op silently dropping the matured collections. Bare and _1
+     * never coexist within a parent, so the identity space stays
+     * collision-free (idempotency key = FULL identity, engineering canon).
+     */
     private void claimBatches(final CrwEmissionGroupEntity g, final LocalDate runDate) {
         List<Integer> bounds = g.getExpectedBatchCount() > 1
                 ? emissions.batchBoundaries(runDate, g.getArrivalId(), g.getAppliedMax()) : List.of();
+        long prior = emissions.countPriorArtifacts(g.getArrivalId(), runDate);
+        boolean suffixed = g.isSplit() || prior > 0;
         int lo = 0; // exclusive lower bound sequence; first batch starts at the beginning
         for (int ordinal = 1; ordinal <= g.getExpectedBatchCount(); ordinal++) {
             int hi = ordinal <= bounds.size() ? bounds.get(ordinal - 1) : -1; // -1 = open-ended tail
-            String outbound = g.isSplit() ? g.getSourceMsgId() + "_" + ordinal : g.getSourceMsgId();
-            String file = g.isSplit()
-                    ? "%s_%s_%d_PAIN008.xml".formatted(g.getClient(), g.getSourceMsgId(), ordinal)
+            long artifact = prior + ordinal;
+            String outbound = suffixed
+                    ? "%s_%d".formatted(g.getSourceMsgId(), artifact) : g.getSourceMsgId();
+            String file = suffixed
+                    ? "%s_%s_%d_PAIN008.xml".formatted(g.getClient(), g.getSourceMsgId(), artifact)
                     : "%s_%s_PAIN008.xml".formatted(g.getClient(), g.getSourceMsgId());
             emissions.claimSnapshot(CrwEmissionEntity.plannedBatch(g.getId(), g.getArrivalId(),
                     runDate, ordinal, outbound, file));

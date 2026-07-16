@@ -10,9 +10,11 @@ import java.util.List;
 
 /**
  * Thin per-lane entry adapter (3-tier, SCRUM-55 Feature 2): one partitioned
- * worker execution = one client lane (comma-joined client token from the
- * ClientLanePartitioner). Job identity: (run.date, window) per R-16/R-37.
- * Instantiated step-scoped by CrwJobConfig, one instance per lane.
+ * worker execution = one client lane. The comma-joined client list arrives
+ * via the lane's ExecutionContext 'clients' key (the step NAME stays the
+ * bounded lane-N key, STEP_NAME is VARCHAR(100)). Job identity:
+ * (run.date, window) per R-16/R-37. Instantiated step-scoped by
+ * CrwJobConfig, one instance per lane.
  */
 public class EmissionTasklet implements Tasklet {
 
@@ -20,10 +22,10 @@ public class EmissionTasklet implements Tasklet {
     private final LocalDate runDate;
     private final List<String> clients;
 
-    public EmissionTasklet(final LaneEmissionService lanes, final LocalDate runDate, final String clientLane) {
+    public EmissionTasklet(final LaneEmissionService lanes, final LocalDate runDate, final String laneClients) {
         this.lanes = lanes;
         this.runDate = runDate;
-        this.clients = List.of(clientLane.split(","));
+        this.clients = List.of(laneClients.split(","));
     }
 
     @Override

@@ -101,6 +101,44 @@ class EmissionSplitIT extends CrwTestcontainersBase {
         assertThat(memberTotalAcrossBatches(arrivalId)).isEqualTo(10001L); // no dup members
     }
 
+    /**
+     * Cross-entity collision regression (SCRUM-55 review BLOCKER): the same
+     * arrival becomes due AGAIN when its warehoused rows mature on a later
+     * run date. Day 2 is a DISTINCT entity under the full identity
+     * (arrival_id, run_date, batch_ordinal), so it must emit a NEW outbound
+     * artifact (sequence continues per source MsgId), never reuse the bare
+     * MsgId (a reuse is either a DuplicateKeyException on the outbound
+     * unique index, a StagedWrite restart no-op that silently drops the
+     * matured money, or a duplicate MsgId on the wire).
+     */
+    @Test
+    void futuredRowsMaturingOnALaterRunDateEmitANewOutboundArtifact() throws Exception {
+        UUID arrivalId = UUID.randomUUID();
+        LocalDate dayOne = LocalDate.of(2026, 8, 6);
+        LocalDate dayTwo = LocalDate.of(2026, 8, 7);
+        seedTwoDateArrival(arrivalId, "FNBRF01", "DCRERF2026071600000013", 5, 4, dayOne, dayTwo);
+
+        assertThat(service.emitDue(dayOne)).isEqualTo(1);
+        Path d1 = out().resolve("FNBRF01_DCRERF2026071600000013_PAIN008.xml");
+        assertThat(d1).exists();
+        byte[] dayOneBytes = Files.readAllBytes(d1);
+
+        assertThat(service.emitDue(dayTwo)).isEqualTo(1);       // day 2: matured rows MUST emit
+
+        Path d2 = out().resolve("FNBRF01_DCRERF2026071600000013_2_PAIN008.xml");
+        assertThat(d2).exists();
+        assertThat(Files.readAllBytes(d1)).isEqualTo(dayOneBytes); // day-1 artifact untouched
+        List<String> xml = Files.readAllLines(d2);
+        assertThat(xml).anyMatch(l -> l.contains("<MsgId>DCRERF2026071600000013_2</MsgId>"));
+        assertThat(xml).anyMatch(l -> l.contains("<NbOfTxs>4</NbOfTxs>"));
+
+        var dayTwoBatches = emissions.findByArrivalIdAndRunDateOrderByBatchOrdinal(arrivalId, dayTwo);
+        assertThat(dayTwoBatches).hasSize(1);
+        assertThat(dayTwoBatches.get(0).getOutboundMsgId()).isEqualTo("DCRERF2026071600000013_2");
+        assertThat(dayTwoBatches.get(0).getState()).isEqualTo("VISIBLE");
+        assertThat(memberTotalAcrossBatches(arrivalId)).isEqualTo(9L); // no dup members across run dates
+    }
+
     @Test
     void alreadyVisibleParentIsAPerParentNoOpWarn() {
         UUID arrivalId = UUID.randomUUID();

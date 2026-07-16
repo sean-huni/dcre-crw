@@ -59,7 +59,12 @@
 
     <changeSet id="003-split-backfill" author="dcre">
         <!-- LIQUIBASE-SQL-EXCEPTION: INSERT..SELECT backfill (DML) has no typed-tag equivalent.
-             Legacy pre-split rows become single-batch groups so every reader join stays total. -->
+             Legacy pre-split rows become single-batch groups so every reader join stays total.
+             SCRUM-55 review fix: outbound ids enumerate the parent's artifacts by run_date
+             (earliest keeps the bare source MsgId, later re-emissions continue _2, _3, ...),
+             matching the runtime cross-run-date identity ruling; a flat bare-id assignment
+             violates uq_emission_outbound_msg on any legacy multi-date arrival and fails the
+             migration at startup. -->
         <sql>
             INSERT INTO crw_emission_group (arrival_id, client, source_msg_id, run_date, applied_max,
                                             total_tx, total_amount, expected_batch_count, split)
@@ -71,10 +76,17 @@
             FROM crw_emission e
             WHERE e.group_id IS NULL
             ON CONFLICT (arrival_id, run_date) DO NOTHING;
-            UPDATE crw_emission e SET group_id = g.id,
-                   outbound_msg_id = COALESCE(e.outbound_msg_id, g.source_msg_id)
-            FROM crw_emission_group g
-            WHERE g.arrival_id = e.arrival_id AND g.run_date = e.run_date AND e.group_id IS NULL;
+            UPDATE crw_emission e
+            SET group_id = g.id,
+                outbound_msg_id = COALESCE(e.outbound_msg_id,
+                    CASE WHEN r.rn = 1 THEN g.source_msg_id
+                         ELSE g.source_msg_id || '_' || r.rn::STRING END)
+            FROM crw_emission_group g,
+                 (SELECT id, row_number() OVER (PARTITION BY arrival_id
+                                                ORDER BY run_date, batch_ordinal) AS rn
+                  FROM crw_emission WHERE group_id IS NULL) AS r
+            WHERE g.arrival_id = e.arrival_id AND g.run_date = e.run_date
+              AND r.id = e.id AND e.group_id IS NULL;
         </sql>
     </changeSet>
 </databaseChangeLog>

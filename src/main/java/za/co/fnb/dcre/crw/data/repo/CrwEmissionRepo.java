@@ -129,6 +129,17 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
     void freezeTotals(@Param("id") UUID id, @Param("c") long c, @Param("s") BigDecimal s);
 
     /**
+     * Batches already claimed for the parent on OTHER run dates (SCRUM-55
+     * review fix): the outbound artifact sequence continues across run dates
+     * (a matured-warehoused re-emission is a NEW physical artifact), so bare
+     * MsgId and _N identities never repeat within a parent. Runs inside the
+     * arrival transaction; committed prior plans are immutable, so the offset
+     * is stable for every replay of this (arrival, run_date).
+     */
+    @Query("SELECT count(*) FROM crw_emission WHERE arrival_id = :arrivalId AND run_date <> :runDate")
+    long countPriorArtifacts(@Param("arrivalId") UUID arrivalId, @Param("runDate") LocalDate runDate);
+
+    /**
      * Snapshot claim (R-24) at batch grain (SCRUM-55): first writer wins on the
      * FULL identity (arrival_id, run_date, batch_ordinal); a restart no-ops and
      * reuses the existing batch row.

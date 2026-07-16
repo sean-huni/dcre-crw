@@ -51,8 +51,8 @@ public class CrwJobConfig {
     @StepScope
     public EmissionTasklet emissionTasklet(LaneEmissionService lanes,
             @Value("#{jobParameters['run.date']}") String runDate,
-            @Value("#{stepExecutionContext['client']}") String clientLane) {
-        return new EmissionTasklet(lanes, LocalDate.parse(runDate), clientLane);
+            @Value("#{stepExecutionContext['clients']}") String laneClients) {
+        return new EmissionTasklet(lanes, LocalDate.parse(runDate), laneClients);
     }
 
     @Bean
