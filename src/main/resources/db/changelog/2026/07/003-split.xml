@@ -51,6 +51,12 @@
         </createIndex>
     </changeSet>
 
+    <changeSet id="003-split-state-width" author="dcre">
+        <!-- The internal MATERIALIZED_MEMBERS sub-state (20 chars) exceeds the original
+             VARCHAR(16); widening is a no-rewrite change on CRDB, re-run safe. -->
+        <modifyDataType tableName="crw_emission" columnName="state" newDataType="VARCHAR(32)"/>
+    </changeSet>
+
     <changeSet id="003-split-backfill" author="dcre">
         <!-- LIQUIBASE-SQL-EXCEPTION: INSERT..SELECT backfill (DML) has no typed-tag equivalent.
              Legacy pre-split rows become single-batch groups so every reader join stays total. -->

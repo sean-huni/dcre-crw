@@ -9,7 +9,9 @@ import za.co.fnb.dcre.crw.data.model.DueArrivalRow;
 import za.co.fnb.dcre.crw.data.model.DueRow;
 import za.co.fnb.dcre.crw.data.model.FuturedCountRow;
 import za.co.fnb.dcre.crw.data.model.FuturedRow;
+import za.co.fnb.dcre.crw.data.model.PlanTotals;
 
+import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.util.List;
 import java.util.Optional;
@@ -69,6 +71,37 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
             ORDER BY t.sequence""", rowMapperClass = FuturedRowMapper.class)
     List<FuturedRow> findFuturedForArrival(@Param("arrivalId") UUID arrivalId,
                                            @Param("processDate") LocalDate processDate);
+
+    /**
+     * Whole-parent totals for the frozen plan (SCRUM-55): executes inside the
+     * caller's arrival transaction, so totals, boundaries and member claims
+     * share one CRDB snapshot and the due-set cannot shift mid-plan.
+     */
+    @Query(value = """
+            SELECT count(*) AS total_tx, COALESCE(sum(t.amount), 0) AS total_amount
+            FROM cde_schedule s
+            JOIN validation_log v ON v.arrival_id = s.arrival_id AND v.sequence = s.sequence AND v.outcome = 'PASS'
+            JOIN tx_entry t ON t.arrival_id = s.arrival_id AND t.sequence = s.sequence
+            WHERE s.process_date = :runDate AND s.arrival_id = :arrivalId""",
+            rowMapperClass = PlanTotalsRowMapper.class)
+    PlanTotals planTotals(@Param("runDate") LocalDate runDate, @Param("arrivalId") UUID arrivalId);
+
+    /** Ordinal-th boundary sequences: the eligible rows ranked by original sequence, every maxSize-th. */
+    @Query(value = """
+            SELECT sequence FROM (
+                SELECT t.sequence, row_number() OVER (ORDER BY t.sequence) AS rn
+                FROM cde_schedule s
+                JOIN validation_log v ON v.arrival_id = s.arrival_id AND v.sequence = s.sequence AND v.outcome = 'PASS'
+                JOIN tx_entry t ON t.arrival_id = s.arrival_id AND t.sequence = s.sequence
+                WHERE s.process_date = :runDate AND s.arrival_id = :arrivalId) AS ranked
+            WHERE rn % :maxSize = 0 ORDER BY sequence""", rowMapperClass = SequenceRowMapper.class)
+    List<Integer> batchBoundaries(@Param("runDate") LocalDate runDate, @Param("arrivalId") UUID arrivalId,
+                                  @Param("maxSize") int maxSize);
+
+    /** Freezes the batch's member totals at plan time; R-24 reconciles each file against its OWN frozen values. */
+    @Modifying
+    @Query("UPDATE crw_emission SET tx_count = :c, control_sum = :s, updated_at = now() WHERE id = :id")
+    void freezeTotals(@Param("id") UUID id, @Param("c") long c, @Param("s") BigDecimal s);
 
     /**
      * Snapshot claim (R-24) at batch grain (SCRUM-55): first writer wins on the

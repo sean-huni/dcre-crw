@@ -30,17 +30,17 @@ class SplitSchemaIT extends CrwTestcontainersBase {
     @Test
     void groupAndOrdinalBatchesRoundTrip() {
         UUID arrival = UUID.randomUUID();
-        var g = CrwEmissionGroupEntity.planned(arrival, "FNBRF01", "DCRERF2026071600000001",
+        var g = CrwEmissionGroupEntity.planned(arrival, "FNBRF01", "DCRERF2026071600000900",
                 LocalDate.of(2026, 7, 16), 5000, 12001L, new BigDecimal("120010.00"), 3, true);
         groups.save(g);
 
         emissions.claimSnapshot(CrwEmissionEntity.plannedBatch(g.getId(), arrival,
-                g.getRunDate(), 1, "DCRERF2026071600000001_1", "FNBRF01_DCRERF2026071600000001_1_PAIN008.xml"));
+                g.getRunDate(), 1, "DCRERF2026071600000900_1", "FNBRF01_DCRERF2026071600000900_1_PAIN008.xml"));
         emissions.claimSnapshot(CrwEmissionEntity.plannedBatch(g.getId(), arrival,
-                g.getRunDate(), 2, "DCRERF2026071600000001_2", "FNBRF01_DCRERF2026071600000001_2_PAIN008.xml"));
+                g.getRunDate(), 2, "DCRERF2026071600000900_2", "FNBRF01_DCRERF2026071600000900_2_PAIN008.xml"));
         // same ordinal again = restart no-op, not a violation
         emissions.claimSnapshot(CrwEmissionEntity.plannedBatch(g.getId(), arrival,
-                g.getRunDate(), 2, "DCRERF2026071600000001_2", "FNBRF01_DCRERF2026071600000001_2_PAIN008.xml"));
+                g.getRunDate(), 2, "DCRERF2026071600000900_2", "FNBRF01_DCRERF2026071600000900_2_PAIN008.xml"));
 
         assertThat(emissions.findByArrivalIdAndRunDateOrderByBatchOrdinal(arrival, g.getRunDate())).hasSize(2);
         assertThat(groups.findByArrivalIdAndRunDate(arrival, g.getRunDate())).isPresent();
