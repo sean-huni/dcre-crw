@@ -47,7 +47,7 @@ Reads (grants-based): `cde_schedule` (CDE), `validation_log` (CTV), `tx_entry` +
 Local one-shot run against the kind cluster's CRDB (dcre-infra `scripts/crdb-forward.sh` forwards host 26258 to cluster 26257):
 
 ```bash
-DCRE_DB_URL="jdbc:postgresql://localhost:26258/dcre_collections?sslmode=disable" \
+DCRE_DB_URL="jdbc:postgresql://localhost:26258/dcre_col?sslmode=disable" \
   java -jar build/libs/crw-2.0.jar run.date=2026-07-15 window=w1
 ```
 
@@ -57,7 +57,7 @@ The JVM exit code carries the Batch verdict (R-34). A clean clone runs with NO `
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `DCRE_DB_URL` | `jdbc:postgresql://localhost:26257/dcre_collections?sslmode=disable` | shared CockroachDB JDBC URL |
+| `DCRE_DB_URL` | `jdbc:postgresql://localhost:26257/dcre_col?sslmode=disable` | shared CockroachDB JDBC URL |
 | `DCRE_DB_USER` | `root` | DB user |
 | `DCRE_DB_PASSWORD` | (empty) | DB password |
 | `DCRE_EXCHANGE_ROOT` | `../../../../../infra/dcre-infra/exchange` | exchange tree root: per-client `fint-req/out` output + `outcomes/` seam |
