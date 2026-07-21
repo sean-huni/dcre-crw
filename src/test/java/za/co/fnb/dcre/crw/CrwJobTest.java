@@ -27,6 +27,7 @@ import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 @SpringBootTest(properties = {"spring.batch.job.enabled=false", "dcre.exchange-root=build/test-exchange",
         "DCRE_EXCHANGE_ROOT=build/test-exchange"})
@@ -143,6 +144,28 @@ class CrwJobTest {
                                 + " seq=-1 e2e=- reason=ALREADY_VISIBLE batch=1")),
                 "file-level ALREADY_VISIBLE WARN (R-38 exclusion visibility, SCRUM-55 batch grain)");
         emissionLogger.detachAppender(warns);
+    }
+
+    @Test
+    void localSeamFallbackNameIsSelfDescribing() throws Exception {
+        // SCRUM-58: without JOB_NAME env the outcome seam file must carry the
+        // self-describing fleet-wide fallback local-crw-<executionId>.
+        assumeTrue(System.getenv("JOB_NAME") == null, "seam fallback test requires no JOB_NAME in the environment");
+        UUID arrival = UUID.randomUUID();
+        String msgId = "DCRERFCRW" + arrival.toString().substring(0, 6);
+        // Isolated run date keeps this arrival out of the other tests' windows.
+        seed(arrival, "FNBRF01", msgId, 1, "2026-05-05", "2026-05-12");
+
+        JobExecution run = jobOperator.start(crwJob, new JobParametersBuilder()
+                .addString("run.date", "2026-05-05", true)
+                .addString("window", "ws", true).toJobParameters());
+        assertEquals(BatchStatus.COMPLETED, run.getStatus());
+
+        Path outcome = Path.of("build/test-exchange/outcomes", "local-crw-" + run.getId());
+        assertTrue(Files.exists(outcome),
+                "local seam fallback must be self-describing: local-crw-<executionId> (SCRUM-58)");
+        assertEquals(List.of("BUSINESS_ACCEPTED"), Files.readAllLines(outcome),
+                "verdict semantics preserved byte-exact across the OutcomeSeamListener swap");
     }
 
     @Test
