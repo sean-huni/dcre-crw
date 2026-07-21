@@ -26,35 +26,63 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
      * claims). Validation is checked there too: an arrival whose due rows
      * all failed validation lists here, plans empty, and is skipped without
      * a claim (same net outcome as the old joined query).
+     * SCRUM-69 pay arm: flow='PAY' rows have NO cde_schedule; they are due
+     * from ingest day once AIS has verdicted and validation passed.
      */
     @Query(value = """
             SELECT DISTINCT s.arrival_id, h.initg_pty, h.msg_id
             FROM cde_schedule s
             JOIN tx_header h ON h.arrival_id = s.arrival_id
             WHERE s.process_date = :runDate
-            ORDER BY s.arrival_id""", rowMapperClass = DueArrivalRowMapper.class)
+            UNION
+            SELECT h.arrival_id, h.initg_pty, h.msg_id
+            FROM tx_header h
+            WHERE h.flow = 'PAY'
+              AND EXISTS (SELECT 1 FROM ais_verdict av WHERE av.arrival_id = h.arrival_id)
+              AND EXISTS (SELECT 1 FROM validation_log v WHERE v.arrival_id = h.arrival_id
+                          AND v.outcome = 'PASS')
+              AND :runDate >= CAST(h.created_at AS DATE)
+            ORDER BY arrival_id""", rowMapperClass = DueArrivalRowMapper.class)
     List<DueArrivalRow> findDueArrivals(@Param("runDate") LocalDate runDate);
 
     /**
      * One client lane's due parents (SCRUM-55 Feature 2), FIFO by eligibility
      * order: tx_header insertion order (created_at), arrival id as the
-     * deterministic tie-break (insertion order, Sean ruling 9).
+     * deterministic tie-break (insertion order, Sean ruling 9). The ORDER BY
+     * spans BOTH arms of the union, so DC and pay parents interleave in one
+     * FIFO sequence (SCRUM-69).
      */
     @Query(value = """
             SELECT DISTINCT s.arrival_id, h.initg_pty, h.msg_id, h.created_at
             FROM cde_schedule s
             JOIN tx_header h ON h.arrival_id = s.arrival_id
             WHERE s.process_date = :runDate AND h.initg_pty = :client
-            ORDER BY h.created_at, s.arrival_id""", rowMapperClass = DueArrivalRowMapper.class)
+            UNION
+            SELECT h.arrival_id, h.initg_pty, h.msg_id, h.created_at
+            FROM tx_header h
+            WHERE h.flow = 'PAY' AND h.initg_pty = :client
+              AND EXISTS (SELECT 1 FROM ais_verdict av WHERE av.arrival_id = h.arrival_id)
+              AND EXISTS (SELECT 1 FROM validation_log v WHERE v.arrival_id = h.arrival_id
+                          AND v.outcome = 'PASS')
+              AND :runDate >= CAST(h.created_at AS DATE)
+            ORDER BY created_at, arrival_id""", rowMapperClass = DueArrivalRowMapper.class)
     List<DueArrivalRow> findDueArrivals(@Param("runDate") LocalDate runDate, @Param("client") String client);
 
-    /** The lane universe for the partitioner: distinct clients with work due on the run date. */
+    /** The lane universe for the partitioner: distinct clients with work due on the run date (both flows, SCRUM-69). */
     @Query(value = """
             SELECT DISTINCT h.initg_pty
             FROM cde_schedule s
             JOIN tx_header h ON h.arrival_id = s.arrival_id
             WHERE s.process_date = :runDate
-            ORDER BY h.initg_pty""", rowMapperClass = ClientRowMapper.class)
+            UNION
+            SELECT h.initg_pty
+            FROM tx_header h
+            WHERE h.flow = 'PAY'
+              AND EXISTS (SELECT 1 FROM ais_verdict av WHERE av.arrival_id = h.arrival_id)
+              AND EXISTS (SELECT 1 FROM validation_log v WHERE v.arrival_id = h.arrival_id
+                          AND v.outcome = 'PASS')
+              AND :runDate >= CAST(h.created_at AS DATE)
+            ORDER BY initg_pty""", rowMapperClass = ClientRowMapper.class)
     List<String> findDueClients(@Param("runDate") LocalDate runDate);
 
     /**
@@ -100,25 +128,45 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
     /**
      * Whole-parent totals for the frozen plan (SCRUM-55): executes inside the
      * caller's arrival transaction, so totals, boundaries and member claims
-     * share one CRDB snapshot and the due-set cannot shift mid-plan.
+     * share one CRDB snapshot and the due-set cannot shift mid-plan. The pay
+     * arm (SCRUM-69) selects PASS rows without any cde reference; UNION on
+     * (sequence, amount) keeps a row single-counted even if both arms ever
+     * matched.
      */
     @Query(value = """
-            SELECT count(*) AS total_tx, COALESCE(sum(t.amount), 0) AS total_amount
-            FROM cde_schedule s
-            JOIN validation_log v ON v.arrival_id = s.arrival_id AND v.sequence = s.sequence AND v.outcome = 'PASS'
-            JOIN tx_entry t ON t.arrival_id = s.arrival_id AND t.sequence = s.sequence
-            WHERE s.process_date = :runDate AND s.arrival_id = :arrivalId""",
-            rowMapperClass = PlanTotalsRowMapper.class)
-    PlanTotals planTotals(@Param("runDate") LocalDate runDate, @Param("arrivalId") UUID arrivalId);
-
-    /** Ordinal-th boundary sequences: the eligible rows ranked by original sequence, every maxSize-th. */
-    @Query(value = """
-            SELECT sequence FROM (
-                SELECT t.sequence, row_number() OVER (ORDER BY t.sequence) AS rn
+            SELECT count(*) AS total_tx, COALESCE(sum(m.amount), 0) AS total_amount FROM (
+                SELECT t.sequence, t.amount
                 FROM cde_schedule s
                 JOIN validation_log v ON v.arrival_id = s.arrival_id AND v.sequence = s.sequence AND v.outcome = 'PASS'
                 JOIN tx_entry t ON t.arrival_id = s.arrival_id AND t.sequence = s.sequence
-                WHERE s.process_date = :runDate AND s.arrival_id = :arrivalId) AS ranked
+                WHERE s.process_date = :runDate AND s.arrival_id = :arrivalId
+                UNION
+                SELECT t.sequence, t.amount
+                FROM tx_header h
+                JOIN validation_log v ON v.arrival_id = h.arrival_id AND v.outcome = 'PASS'
+                JOIN tx_entry t ON t.arrival_id = h.arrival_id AND t.sequence = v.sequence
+                WHERE h.arrival_id = :arrivalId AND h.flow = 'PAY'
+                  AND :runDate >= CAST(h.created_at AS DATE)) AS m""",
+            rowMapperClass = PlanTotalsRowMapper.class)
+    PlanTotals planTotals(@Param("runDate") LocalDate runDate, @Param("arrivalId") UUID arrivalId);
+
+    /** Ordinal-th boundary sequences: the eligible rows (either flow's arm, SCRUM-69) ranked by original sequence, every maxSize-th. */
+    @Query(value = """
+            SELECT sequence FROM (
+                SELECT m.sequence, row_number() OVER (ORDER BY m.sequence) AS rn
+                FROM (
+                    SELECT t.sequence
+                    FROM cde_schedule s
+                    JOIN validation_log v ON v.arrival_id = s.arrival_id AND v.sequence = s.sequence AND v.outcome = 'PASS'
+                    JOIN tx_entry t ON t.arrival_id = s.arrival_id AND t.sequence = s.sequence
+                    WHERE s.process_date = :runDate AND s.arrival_id = :arrivalId
+                    UNION
+                    SELECT t.sequence
+                    FROM tx_header h
+                    JOIN validation_log v ON v.arrival_id = h.arrival_id AND v.outcome = 'PASS'
+                    JOIN tx_entry t ON t.arrival_id = h.arrival_id AND t.sequence = v.sequence
+                    WHERE h.arrival_id = :arrivalId AND h.flow = 'PAY'
+                      AND :runDate >= CAST(h.created_at AS DATE)) AS m) AS ranked
             WHERE rn % :maxSize = 0 ORDER BY sequence""", rowMapperClass = SequenceRowMapper.class)
     List<Integer> batchBoundaries(@Param("runDate") LocalDate runDate, @Param("arrivalId") UUID arrivalId,
                                   @Param("maxSize") int maxSize);

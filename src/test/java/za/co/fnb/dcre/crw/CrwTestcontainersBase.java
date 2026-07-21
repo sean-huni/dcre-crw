@@ -39,14 +39,14 @@ public abstract class CrwTestcontainersBase {
     protected JdbcTemplate jdbc;
 
     /**
-     * Spine fixture mirroring CrwJobTest's seed, set-based for the split
-     * scale (12k+ rows): every sequence 1..total is PASS-validated and due
-     * on the run date. generate_series keeps the seed at 3 statements.
+     * Cross-service spine tables the CRW queries read (CRR/AIS owned in
+     * production): tx_header carries flow (SCRUM-69, default COL) and
+     * ais_verdict backs the pay-flow eligibility arm.
      */
-    protected void seedDueArrival(final UUID arrival, final String client, final String msgId,
-            final int total, final LocalDate runDate) {
+    protected void ensureSpineTables() {
         jdbc.execute("CREATE TABLE IF NOT EXISTS tx_header (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
                 + " arrival_id UUID UNIQUE, msg_id VARCHAR(35), initg_pty VARCHAR(35),"
+                + " flow VARCHAR(8) NOT NULL DEFAULT 'COL',"
                 + " created_at TIMESTAMPTZ NOT NULL DEFAULT now())");
         jdbc.execute("CREATE TABLE IF NOT EXISTS tx_entry (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
                 + " arrival_id UUID, sequence INT, e2e VARCHAR(35), amount DECIMAL(18,2), UNIQUE (arrival_id, sequence))");
@@ -54,6 +54,18 @@ public abstract class CrwTestcontainersBase {
                 + " arrival_id UUID, sequence INT, outcome VARCHAR(32), UNIQUE (arrival_id, sequence))");
         jdbc.execute("CREATE TABLE IF NOT EXISTS cde_schedule (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
                 + " arrival_id UUID, sequence INT, process_date DATE, UNIQUE (arrival_id, sequence))");
+        jdbc.execute("CREATE TABLE IF NOT EXISTS ais_verdict (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
+                + " arrival_id UUID, sequence INT, action VARCHAR(16), UNIQUE (arrival_id, sequence))");
+    }
+
+    /**
+     * Spine fixture mirroring CrwJobTest's seed, set-based for the split
+     * scale (12k+ rows): every sequence 1..total is PASS-validated and due
+     * on the run date. generate_series keeps the seed at 3 statements.
+     */
+    protected void seedDueArrival(final UUID arrival, final String client, final String msgId,
+            final int total, final LocalDate runDate) {
+        ensureSpineTables();
         jdbc.update("UPSERT INTO tx_header (arrival_id, msg_id, initg_pty) VALUES (?,?,?)", arrival, msgId, client);
         jdbc.update("INSERT INTO tx_entry (arrival_id, sequence, e2e, amount)"
                 + " SELECT ?, i, 'E2E' || i::STRING, 10.00 FROM generate_series(1, ?) AS g(i)"
