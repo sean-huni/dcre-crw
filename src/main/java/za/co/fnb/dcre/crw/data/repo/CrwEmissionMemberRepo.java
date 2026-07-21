@@ -17,9 +17,9 @@ public interface CrwEmissionMemberRepo extends CrudRepository<CrwEmissionMemberE
      * Set-based ordinal member claim (SCRUM-55): the [loSeq, hiSeq] slice of
      * the eligible rows is claimed in ONE statement inside the arrival
      * transaction; hiSeq -1 means the open-ended tail. No Java list of 300k
-     * rows ever (SCRUM-42 memory lesson). Pay-flow members (SCRUM-69) are the
-     * PASS rows of a flow='PAY' parent, no cde reference; UNION on the full
-     * member tuple keeps the claim single-sourced per sequence.
+     * rows ever (SCRUM-42 memory lesson). The pay arm (SCRUM-69) is the
+     * single-source CrwEmissionRepo.PAY_MEMBER_ROWS fragment; UNION on the
+     * full member tuple keeps the claim single-sourced per sequence.
      */
     @Modifying
     @Query("""
@@ -32,11 +32,8 @@ public interface CrwEmissionMemberRepo extends CrudRepository<CrwEmissionMemberE
                 WHERE s.process_date = :runDate AND s.arrival_id = :arrivalId
                 UNION
                 SELECT t.sequence, t.e2e, t.amount
-                FROM tx_header h
-                JOIN validation_log v ON v.arrival_id = h.arrival_id AND v.outcome = 'PASS'
-                JOIN tx_entry t ON t.arrival_id = h.arrival_id AND t.sequence = v.sequence
-                WHERE h.arrival_id = :arrivalId AND h.flow = 'PAY'
-                  AND :runDate >= CAST(h.created_at AS DATE)) AS m
+                """ + CrwEmissionRepo.PAY_MEMBER_ROWS + """
+            ) AS m
             WHERE m.sequence >= :loSeq AND (:hiSeq = -1 OR m.sequence <= :hiSeq)
             ON CONFLICT (emission_id, sequence) DO NOTHING""")
     void claimMembers(@Param("emissionId") UUID emissionId, @Param("runDate") LocalDate runDate,

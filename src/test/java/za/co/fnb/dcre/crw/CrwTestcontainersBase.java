@@ -41,9 +41,11 @@ public abstract class CrwTestcontainersBase {
     /**
      * Cross-service spine tables the CRW queries read (CRR/AIS owned in
      * production): tx_header carries flow (SCRUM-69, default COL) and
-     * ais_verdict backs the pay-flow eligibility arm.
+     * ais_verdict backs the pay-flow eligibility arm. SINGLE DDL source for
+     * every crw test context (review m3): CrwJobTest, the BDD glue and the
+     * lane IT call this static against their own datasource.
      */
-    protected void ensureSpineTables() {
+    public static void ensureSpineTables(final JdbcTemplate jdbc) {
         jdbc.execute("CREATE TABLE IF NOT EXISTS tx_header (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
                 + " arrival_id UUID UNIQUE, msg_id VARCHAR(35), initg_pty VARCHAR(35),"
                 + " flow VARCHAR(8) NOT NULL DEFAULT 'COL',"
@@ -56,6 +58,11 @@ public abstract class CrwTestcontainersBase {
                 + " arrival_id UUID, sequence INT, process_date DATE, UNIQUE (arrival_id, sequence))");
         jdbc.execute("CREATE TABLE IF NOT EXISTS ais_verdict (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
                 + " arrival_id UUID, sequence INT, action VARCHAR(16), UNIQUE (arrival_id, sequence))");
+    }
+
+    /** Instance convenience over the shared static DDL source. */
+    protected void ensureSpineTables() {
+        ensureSpineTables(jdbc);
     }
 
     /**

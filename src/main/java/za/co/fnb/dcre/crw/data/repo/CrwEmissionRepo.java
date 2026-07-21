@@ -18,6 +18,41 @@ import java.util.UUID;
 public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID> {
 
     /**
+     * SCRUM-69 pay-arm gates, SINGLE SOURCE for every pay-eligibility arm
+     * (review B1/M1). A flow='PAY' parent is due when:
+     * - M1: the AIS verdict set COVERS the PASS set (count comparison, not
+     *   bare EXISTS): a slice-committing mid-run AIS or an AIS that died
+     *   stays fail-closed until the last verdict lands;
+     * - at least one PASS row exists (nothing validated = nothing to emit);
+     * - the run date is on/after the ingest day (pay rows are immediate);
+     * - B1: NO emission exists for a STRICTLY EARLIER run date. Strictly
+     *   earlier keeps the same-day crash-resume visible (day-1 rows never
+     *   exclude a day-1 re-poll) while a fully or partially emitted day-1
+     *   parent is never due again on day 2 (recovery re-runs day 1).
+     */
+    String PAY_DUE_GATES = """
+            h.flow = 'PAY'
+              AND (SELECT count(*) FROM ais_verdict av WHERE av.arrival_id = h.arrival_id)
+                  >= (SELECT count(*) FROM validation_log vp WHERE vp.arrival_id = h.arrival_id
+                      AND vp.outcome = 'PASS')
+              AND EXISTS (SELECT 1 FROM validation_log vp WHERE vp.arrival_id = h.arrival_id
+                          AND vp.outcome = 'PASS')
+              AND :runDate >= CAST(h.created_at AS DATE)
+              AND NOT EXISTS (SELECT 1 FROM crw_emission e
+                              WHERE e.arrival_id = h.arrival_id AND e.run_date < :runDate)""";
+
+    /**
+     * Pay-flow member rows (SCRUM-69): the parent's PASS rows joined to the
+     * spine, no cde reference; guarded by the same single-source gates.
+     */
+    String PAY_MEMBER_ROWS = """
+            FROM tx_header h
+                JOIN validation_log v ON v.arrival_id = h.arrival_id AND v.outcome = 'PASS'
+                JOIN tx_entry t ON t.arrival_id = h.arrival_id AND t.sequence = v.sequence
+                WHERE h.arrival_id = :arrivalId AND
+            """ + PAY_DUE_GATES;
+
+    /**
      * Arrivals with at least one transaction scheduled for the run date
      * (SCRUM-42 load fix): scalars only, one row per arrival, no per-tx
      * fanout. The 23x300k whole-backlog join blew CRDB's sql memory budget
@@ -37,12 +72,9 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
             UNION
             SELECT h.arrival_id, h.initg_pty, h.msg_id
             FROM tx_header h
-            WHERE h.flow = 'PAY'
-              AND EXISTS (SELECT 1 FROM ais_verdict av WHERE av.arrival_id = h.arrival_id)
-              AND EXISTS (SELECT 1 FROM validation_log v WHERE v.arrival_id = h.arrival_id
-                          AND v.outcome = 'PASS')
-              AND :runDate >= CAST(h.created_at AS DATE)
-            ORDER BY arrival_id""", rowMapperClass = DueArrivalRowMapper.class)
+            WHERE
+            """ + PAY_DUE_GATES + "\nORDER BY arrival_id",
+            rowMapperClass = DueArrivalRowMapper.class)
     List<DueArrivalRow> findDueArrivals(@Param("runDate") LocalDate runDate);
 
     /**
@@ -60,12 +92,9 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
             UNION
             SELECT h.arrival_id, h.initg_pty, h.msg_id, h.created_at
             FROM tx_header h
-            WHERE h.flow = 'PAY' AND h.initg_pty = :client
-              AND EXISTS (SELECT 1 FROM ais_verdict av WHERE av.arrival_id = h.arrival_id)
-              AND EXISTS (SELECT 1 FROM validation_log v WHERE v.arrival_id = h.arrival_id
-                          AND v.outcome = 'PASS')
-              AND :runDate >= CAST(h.created_at AS DATE)
-            ORDER BY created_at, arrival_id""", rowMapperClass = DueArrivalRowMapper.class)
+            WHERE h.initg_pty = :client AND
+            """ + PAY_DUE_GATES + "\nORDER BY created_at, arrival_id",
+            rowMapperClass = DueArrivalRowMapper.class)
     List<DueArrivalRow> findDueArrivals(@Param("runDate") LocalDate runDate, @Param("client") String client);
 
     /** The lane universe for the partitioner: distinct clients with work due on the run date (both flows, SCRUM-69). */
@@ -77,12 +106,9 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
             UNION
             SELECT h.initg_pty
             FROM tx_header h
-            WHERE h.flow = 'PAY'
-              AND EXISTS (SELECT 1 FROM ais_verdict av WHERE av.arrival_id = h.arrival_id)
-              AND EXISTS (SELECT 1 FROM validation_log v WHERE v.arrival_id = h.arrival_id
-                          AND v.outcome = 'PASS')
-              AND :runDate >= CAST(h.created_at AS DATE)
-            ORDER BY initg_pty""", rowMapperClass = ClientRowMapper.class)
+            WHERE
+            """ + PAY_DUE_GATES + "\nORDER BY initg_pty",
+            rowMapperClass = ClientRowMapper.class)
     List<String> findDueClients(@Param("runDate") LocalDate runDate);
 
     /**
@@ -129,7 +155,7 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
      * Whole-parent totals for the frozen plan (SCRUM-55): executes inside the
      * caller's arrival transaction, so totals, boundaries and member claims
      * share one CRDB snapshot and the due-set cannot shift mid-plan. The pay
-     * arm (SCRUM-69) selects PASS rows without any cde reference; UNION on
+     * arm (SCRUM-69) is the single-source PAY_MEMBER_ROWS fragment; UNION on
      * (sequence, amount) keeps a row single-counted even if both arms ever
      * matched.
      */
@@ -142,11 +168,7 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
                 WHERE s.process_date = :runDate AND s.arrival_id = :arrivalId
                 UNION
                 SELECT t.sequence, t.amount
-                FROM tx_header h
-                JOIN validation_log v ON v.arrival_id = h.arrival_id AND v.outcome = 'PASS'
-                JOIN tx_entry t ON t.arrival_id = h.arrival_id AND t.sequence = v.sequence
-                WHERE h.arrival_id = :arrivalId AND h.flow = 'PAY'
-                  AND :runDate >= CAST(h.created_at AS DATE)) AS m""",
+                """ + PAY_MEMBER_ROWS + ") AS m",
             rowMapperClass = PlanTotalsRowMapper.class)
     PlanTotals planTotals(@Param("runDate") LocalDate runDate, @Param("arrivalId") UUID arrivalId);
 
@@ -162,11 +184,8 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
                     WHERE s.process_date = :runDate AND s.arrival_id = :arrivalId
                     UNION
                     SELECT t.sequence
-                    FROM tx_header h
-                    JOIN validation_log v ON v.arrival_id = h.arrival_id AND v.outcome = 'PASS'
-                    JOIN tx_entry t ON t.arrival_id = h.arrival_id AND t.sequence = v.sequence
-                    WHERE h.arrival_id = :arrivalId AND h.flow = 'PAY'
-                      AND :runDate >= CAST(h.created_at AS DATE)) AS m) AS ranked
+                    """ + PAY_MEMBER_ROWS + """
+            ) AS m) AS ranked
             WHERE rn % :maxSize = 0 ORDER BY sequence""", rowMapperClass = SequenceRowMapper.class)
     List<Integer> batchBoundaries(@Param("runDate") LocalDate runDate, @Param("arrivalId") UUID arrivalId,
                                   @Param("maxSize") int maxSize);

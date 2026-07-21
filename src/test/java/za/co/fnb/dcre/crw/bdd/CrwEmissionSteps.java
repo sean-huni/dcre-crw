@@ -17,6 +17,7 @@ import org.springframework.batch.core.job.parameters.JobParametersBuilder;
 import org.springframework.batch.core.launch.JobOperator;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
+import za.co.fnb.dcre.crw.CrwTestcontainersBase;
 import za.co.fnb.dcre.crw.service.EmissionService;
 
 import java.nio.file.Files;
@@ -55,18 +56,7 @@ public class CrwEmissionSteps {
 
     @Before
     public void setUp() {
-        jdbc.execute("CREATE TABLE IF NOT EXISTS tx_header (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
-                + " arrival_id UUID UNIQUE, msg_id VARCHAR(35), initg_pty VARCHAR(35),"
-                + " flow VARCHAR(8) NOT NULL DEFAULT 'COL',"
-                + " created_at TIMESTAMPTZ NOT NULL DEFAULT now())");
-        jdbc.execute("CREATE TABLE IF NOT EXISTS tx_entry (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
-                + " arrival_id UUID, sequence INT, e2e VARCHAR(35), amount DECIMAL(18,2), UNIQUE (arrival_id, sequence))");
-        jdbc.execute("CREATE TABLE IF NOT EXISTS validation_log (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
-                + " arrival_id UUID, sequence INT, outcome VARCHAR(32), UNIQUE (arrival_id, sequence))");
-        jdbc.execute("CREATE TABLE IF NOT EXISTS cde_schedule (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
-                + " arrival_id UUID, sequence INT, process_date DATE, UNIQUE (arrival_id, sequence))");
-        jdbc.execute("CREATE TABLE IF NOT EXISTS ais_verdict (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
-                + " arrival_id UUID, sequence INT, action VARCHAR(16), UNIQUE (arrival_id, sequence))");
+        CrwTestcontainersBase.ensureSpineTables(jdbc); // single DDL source (review m3)
         emissionLogger = (Logger) LoggerFactory.getLogger(EmissionService.class);
         warnAppender = new ListAppender<>();
         warnAppender.start();

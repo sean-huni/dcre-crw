@@ -53,9 +53,15 @@ class PayFlowEligibilityIT extends CrwTestcontainersBase {
         arrivalId = UUID.randomUUID();
     }
 
-    /** PAY spine: AIS verdict + PASS rows, ZERO cde_schedule rows, ingest stamped on the given day. */
+    /** PAY spine: complete AIS coverage, PASS rows, ZERO cde_schedule rows, ingest stamped on the given day. */
     private void seedPayArrival(final UUID arrival, final String client, final String msgId,
             final int total, final LocalDate ingestDate) {
+        seedPayArrival(arrival, client, msgId, total, total, ingestDate);
+    }
+
+    /** Variant with explicit AIS verdict coverage (M1: verdicts may lag the PASS set mid-run). */
+    private void seedPayArrival(final UUID arrival, final String client, final String msgId,
+            final int total, final int verdicts, final LocalDate ingestDate) {
         ensureSpineTables();
         jdbc.update("UPSERT INTO tx_header (arrival_id, msg_id, initg_pty, flow, created_at)"
                 + " VALUES (?,?,?,'PAY',?::TIMESTAMPTZ)", arrival, msgId, client, ingestDate + " 08:00:00+00");
@@ -65,9 +71,11 @@ class PayFlowEligibilityIT extends CrwTestcontainersBase {
         jdbc.update("INSERT INTO validation_log (arrival_id, sequence, outcome)"
                 + " SELECT ?, i, 'PASS' FROM generate_series(1, ?) AS g(i)"
                 + " ON CONFLICT (arrival_id, sequence) DO NOTHING", arrival, total);
-        jdbc.update("INSERT INTO ais_verdict (arrival_id, sequence, action)"
-                + " SELECT ?, i, 'CREATED' FROM generate_series(1, ?) AS g(i)"
-                + " ON CONFLICT (arrival_id, sequence) DO NOTHING", arrival, total);
+        if (verdicts > 0) {
+            jdbc.update("INSERT INTO ais_verdict (arrival_id, sequence, action)"
+                    + " SELECT ?, i, 'CREATED' FROM generate_series(1, ?) AS g(i)"
+                    + " ON CONFLICT (arrival_id, sequence) DO NOTHING", arrival, verdicts);
+        }
     }
 
     @Test
@@ -112,6 +120,98 @@ class PayFlowEligibilityIT extends CrwTestcontainersBase {
         assertThat(emissions.findDueArrivals(RUN_DATE.minusDays(1)))
                 .noneMatch(row -> row.arrivalId().equals(arrivalId));
         assertThat(emissions.findDueClients(RUN_DATE.minusDays(1))).doesNotContain("FNBRF73");
+    }
+
+    @Test
+    void payParentEmittedOnDayOneIsNotDueOnDayTwo() {
+        // Review B1: without the earlier-run-date guard the parent re-lists on
+        // day 2 and plans a duplicate suffixed emission of the same rows.
+        final String msgId = "DCRERF2026072100000705";
+        seedPayArrival(arrivalId, "FNBRF75", msgId, 3, RUN_DATE);
+        final DueArrivalRow due = new DueArrivalRow(arrivalId, "FNBRF75", msgId);
+        final LocalDate dayTwo = RUN_DATE.plusDays(1);
+
+        final var dayOne = txTemplate.execute(s -> planner.planAndClaim(due, RUN_DATE));
+        dayOne.forEach(batch -> emissions.markVisible(batch.getId()));
+
+        assertThat(emissions.findDueArrivals(dayTwo)).noneMatch(row -> row.arrivalId().equals(arrivalId));
+        assertThat(emissions.findDueArrivals(dayTwo, "FNBRF75")).isEmpty();
+        assertThat(emissions.findDueClients(dayTwo)).doesNotContain("FNBRF75");
+
+        final var dayTwoPlan = txTemplate.execute(s -> planner.planAndClaim(due, dayTwo));
+        assertThat(dayTwoPlan).as("day-2 plan for a day-1-emitted pay parent must be a no-op").isEmpty();
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM crw_emission WHERE arrival_id = ?",
+                Integer.class, arrivalId)).isEqualTo(1);
+    }
+
+    @Test
+    void crashShapedDayOnePlanResumesOnDayOneButNotOnDayTwo() {
+        // Review B1 crash shape: day-1 rows exist non-VISIBLE (kill before
+        // publication). Day-1 re-poll must still list the parent (resume);
+        // day-2 poll must not (recovery re-runs run_date = day 1).
+        final String msgId = "DCRERF2026072100000706";
+        seedPayArrival(arrivalId, "FNBRF76", msgId, 3, RUN_DATE);
+        final DueArrivalRow due = new DueArrivalRow(arrivalId, "FNBRF76", msgId);
+
+        txTemplate.execute(s -> planner.planAndClaim(due, RUN_DATE));
+
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM crw_emission WHERE arrival_id = ?"
+                + " AND state <> 'VISIBLE'", Integer.class, arrivalId)).isEqualTo(1);
+        assertThat(emissions.findDueArrivals(RUN_DATE)).contains(due);
+        assertThat(emissions.findDueArrivals(RUN_DATE.plusDays(1)))
+                .noneMatch(row -> row.arrivalId().equals(arrivalId));
+    }
+
+    @Test
+    void partialAisCoverageIsNotDueUntilTheLastVerdictLands() {
+        // Review M1: AIS slice-commits verdicts mid-run; presence of SOME
+        // verdict must never trigger emission. Due only once the verdict set
+        // covers the PASS set.
+        final String msgId = "DCRERF2026072100000707";
+        seedPayArrival(arrivalId, "FNBRF77", msgId, 3, 2, RUN_DATE);
+        final DueArrivalRow due = new DueArrivalRow(arrivalId, "FNBRF77", msgId);
+
+        assertThat(emissions.findDueArrivals(RUN_DATE)).noneMatch(row -> row.arrivalId().equals(arrivalId));
+        assertThat(emissions.findDueClients(RUN_DATE)).doesNotContain("FNBRF77");
+
+        jdbc.update("INSERT INTO ais_verdict (arrival_id, sequence, action) VALUES (?, 3, 'CREATED')"
+                + " ON CONFLICT (arrival_id, sequence) DO NOTHING", arrivalId);
+        assertThat(emissions.findDueArrivals(RUN_DATE)).contains(due);
+    }
+
+    @Test
+    void payParentWithoutAnyAisVerdictIsNotDue() {
+        // Review m4: an AIS that never ran (or died before its first slice)
+        // stays fail-closed.
+        final String msgId = "DCRERF2026072100000708";
+        seedPayArrival(arrivalId, "FNBRF78", msgId, 3, 0, RUN_DATE);
+
+        assertThat(emissions.findDueArrivals(RUN_DATE)).noneMatch(row -> row.arrivalId().equals(arrivalId));
+        assertThat(emissions.findDueClients(RUN_DATE)).doesNotContain("FNBRF78");
+    }
+
+    @Test
+    void payParentWithZeroPassRowsIsNotDueAndPlansEmpty() {
+        // Review m4: nothing validated PASS means nothing to emit, even with
+        // full AIS coverage of an empty PASS set.
+        final String msgId = "DCRERF2026072100000709";
+        ensureSpineTables();
+        jdbc.update("UPSERT INTO tx_header (arrival_id, msg_id, initg_pty, flow, created_at)"
+                + " VALUES (?,?,?,'PAY',?::TIMESTAMPTZ)", arrivalId, msgId, "FNBRF79", RUN_DATE + " 08:00:00+00");
+        jdbc.update("INSERT INTO tx_entry (arrival_id, sequence, e2e, amount)"
+                + " SELECT ?, i, 'E2E' || i::STRING, 10.00 FROM generate_series(1, 3) AS g(i)"
+                + " ON CONFLICT (arrival_id, sequence) DO NOTHING", arrivalId);
+        jdbc.update("INSERT INTO validation_log (arrival_id, sequence, outcome)"
+                + " SELECT ?, i, 'FAIL' FROM generate_series(1, 3) AS g(i)"
+                + " ON CONFLICT (arrival_id, sequence) DO NOTHING", arrivalId);
+        jdbc.update("INSERT INTO ais_verdict (arrival_id, sequence, action)"
+                + " SELECT ?, i, 'CREATED' FROM generate_series(1, 3) AS g(i)"
+                + " ON CONFLICT (arrival_id, sequence) DO NOTHING", arrivalId);
+
+        assertThat(emissions.findDueArrivals(RUN_DATE)).noneMatch(row -> row.arrivalId().equals(arrivalId));
+        final var plan = txTemplate.execute(s ->
+                planner.planAndClaim(new DueArrivalRow(arrivalId, "FNBRF79", msgId), RUN_DATE));
+        assertThat(plan).isEmpty();
     }
 
     @Test
