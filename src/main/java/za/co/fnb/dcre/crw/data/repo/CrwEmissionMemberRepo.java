@@ -17,17 +17,24 @@ public interface CrwEmissionMemberRepo extends CrudRepository<CrwEmissionMemberE
      * Set-based ordinal member claim (SCRUM-55): the [loSeq, hiSeq] slice of
      * the eligible rows is claimed in ONE statement inside the arrival
      * transaction; hiSeq -1 means the open-ended tail. No Java list of 300k
-     * rows ever (SCRUM-42 memory lesson).
+     * rows ever (SCRUM-42 memory lesson). The pay arm (SCRUM-69) is the
+     * single-source CrwEmissionRepo.PAY_MEMBER_ROWS fragment; UNION on the
+     * full member tuple keeps the claim single-sourced per sequence.
      */
     @Modifying
     @Query("""
             INSERT INTO crw_emission_member (id, emission_id, sequence, e2e, amount)
-            SELECT gen_random_uuid(), :emissionId, t.sequence, t.e2e, t.amount
-            FROM cde_schedule s
-            JOIN validation_log v ON v.arrival_id = s.arrival_id AND v.sequence = s.sequence AND v.outcome = 'PASS'
-            JOIN tx_entry t ON t.arrival_id = s.arrival_id AND t.sequence = s.sequence
-            WHERE s.process_date = :runDate AND s.arrival_id = :arrivalId
-              AND t.sequence >= :loSeq AND (:hiSeq = -1 OR t.sequence <= :hiSeq)
+            SELECT gen_random_uuid(), :emissionId, m.sequence, m.e2e, m.amount FROM (
+                SELECT t.sequence, t.e2e, t.amount
+                FROM cde_schedule s
+                JOIN validation_log v ON v.arrival_id = s.arrival_id AND v.sequence = s.sequence AND v.outcome = 'PASS'
+                JOIN tx_entry t ON t.arrival_id = s.arrival_id AND t.sequence = s.sequence
+                WHERE s.process_date = :runDate AND s.arrival_id = :arrivalId
+                UNION
+                SELECT t.sequence, t.e2e, t.amount
+                """ + CrwEmissionRepo.PAY_MEMBER_ROWS + """
+            ) AS m
+            WHERE m.sequence >= :loSeq AND (:hiSeq = -1 OR m.sequence <= :hiSeq)
             ON CONFLICT (emission_id, sequence) DO NOTHING""")
     void claimMembers(@Param("emissionId") UUID emissionId, @Param("runDate") LocalDate runDate,
                       @Param("arrivalId") UUID arrivalId, @Param("loSeq") int loSeq, @Param("hiSeq") int hiSeq);
