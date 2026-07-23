@@ -20,6 +20,7 @@ import za.co.fnb.dcre.crw.service.EmissionService;
 import za.co.fnb.dcre.crw.service.EmissionTasklet;
 import za.co.fnb.dcre.crw.service.LaneEmissionService;
 import za.co.fnb.dcre.platform.batch.CrdbRetryExceptionHandler;
+import za.co.fnb.dcre.platform.batch.HeartbeatWriter;
 import za.co.fnb.dcre.platform.batch.OutcomeSeamListener;
 import za.co.fnb.dcre.platform.batch.PartitionSizer;
 import za.co.fnb.dcre.platform.batch.StaleExecutionSweeper;
@@ -76,11 +77,14 @@ public class CrwJobConfig {
     }
 
     @Bean
-    public Job crwJob(JobRepository repo, Step emitStep, @Value("${dcre.exchange-root}") String exchangeRoot) {
+    public Job crwJob(JobRepository repo, Step emitStep, HeartbeatWriter heartbeatWriter,
+                      @Value("${dcre.exchange-root}") String exchangeRoot) {
         // SCRUM-58: shared platform-batch seam listener (COMPLETED-gated, constant
         // BUSINESS_ACCEPTED verdict preserved; local fallback local-crw-<executionId>).
+        // SCRUM-88: heartbeatWriter ticks agt_ops.launch_intent while the job runs.
         return new JobBuilder("crwJob", repo)
                 .listener(new OutcomeSeamListener("crw", exchangeRoot, execution -> "BUSINESS_ACCEPTED"))
+                .listener(heartbeatWriter)
                 .start(emitStep)
                 .build();
     }
