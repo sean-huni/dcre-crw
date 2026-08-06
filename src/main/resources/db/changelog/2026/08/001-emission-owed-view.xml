@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!--
+      SCRUM-107: the PUBLISHED contract for "does this arrival still owe Fintegrate
+      an emission?". AGT gates DAG_COMPLETE on it, so a collections arrival can no
+      longer report complete before CRW has written anything (R-37 as amended).
+
+      Published as a view for the same reason prg_report_due and prg_sla_pending are:
+      CRW owns crw_emission, crw_emission_group, cde_schedule and validation_log, and
+      the completeness rule belongs next to them. AGT reading crw_emission.state
+      directly would couple it to a literal this repo treats as provisional.
+
+      OWED, not EMITTED. That distinction is the whole point, and getting it wrong
+      strands arrivals:
+        - an arrival with zero PASS rows can never emit, so it owes nothing and must
+          be allowed to terminate. Gating it on an emission that will never exist
+          leaves it DAG_RUNNING forever (a PARTIAL-mode client with a wholly bad file
+          reaches CTV BUSINESS_PARTIAL, not FILE_REJECTED, so it does hit this path);
+        - a multi-batch arrival owes until EVERY planned batch is VISIBLE, not until
+          the first one is. crw_emission is per (arrival, run_date, batch_ordinal) and
+          publication commits one batch at a time, so any-row-visible completes with
+          batches still undelivered;
+        - a multi-process-date arrival owes until the futured remainder has emitted
+          too, which is a later run_date and a different group entirely.
+    -->
+    <changeSet id="001-crw-emission-owed-view" author="dcre">
+        <!--
+          The view spans tables owned by four services in the shared dcre_col:
+          tx_header (CRR), validation_log (CTV), cde_schedule (CDE) and
+          crw_emission/_group (CRW). All four exist in the real database; in CRW's
+          own isolated Testcontainers database only CRW's do, so the changeset
+          MARK_RANs there rather than failing the build. The predicate itself is
+          exercised against a real database by AGT's EmissionOwedViewIT, which
+          creates all four tables and this view.
+        -->
+        <preConditions onFail="MARK_RAN">
+            <not><viewExists viewName="crw_emission_owed"/></not>
+            <tableExists tableName="tx_header"/>
+            <tableExists tableName="validation_log"/>
+            <tableExists tableName="cde_schedule"/>
+            <tableExists tableName="crw_emission_group"/>
+        </preConditions>
+
+        <createView viewName="crw_emission_owed" fullDefinition="false">
+            SELECT h.arrival_id AS arrival_id,
+                   (
+                     EXISTS (
+                       SELECT 1 FROM cde_schedule s
+                       JOIN validation_log v
+                         ON v.arrival_id = s.arrival_id AND v.sequence = s.sequence
+                       WHERE s.arrival_id = h.arrival_id
+                         AND v.outcome = 'PASS'
+                         AND s.process_date > current_date
+                     )
+                     OR EXISTS (
+                       SELECT 1 FROM crw_emission_group g
+                       WHERE g.arrival_id = h.arrival_id
+                         AND g.expected_batch_count > (
+                           SELECT count(*) FROM crw_emission e
+                           WHERE e.arrival_id = g.arrival_id
+                             AND e.run_date = g.run_date
+                             AND e.state = 'VISIBLE'
+                         )
+                     )
+                     OR (
+                       EXISTS (
+                         SELECT 1 FROM validation_log v2
+                         WHERE v2.arrival_id = h.arrival_id AND v2.outcome = 'PASS'
+                       )
+                       AND NOT EXISTS (
+                         SELECT 1 FROM crw_emission_group g2
+                         WHERE g2.arrival_id = h.arrival_id
+                       )
+                     )
+                   ) AS owed
+            FROM tx_header h
+        </createView>
+
+        <rollback>
+            <dropView viewName="crw_emission_owed"/>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>
