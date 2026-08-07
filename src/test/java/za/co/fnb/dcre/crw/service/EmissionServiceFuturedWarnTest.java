@@ -54,6 +54,10 @@ class EmissionServiceFuturedWarnTest {
     @BeforeEach
     void setUp() {
         emissions = mock(CrwEmissionRepo.class);
+        // A-76: the due path now short-circuits when the peer tables owned by CDE/CTV/CRR
+        // are absent. A bare mock answers false, which would silently make every emitDue
+        // here a no-op, so the fixture must state that the dependencies are present.
+        when(emissions.dueQueryTablesExist()).thenReturn(true);
         final ExchangeLayout layout = new ExchangeLayout(root, Map.of("FNBRF01",
                 Map.of(ExchangeChannel.FINT_REQ, Map.of(ExchangeSub.OUT, "fnbrf01/fint-req/out"))));
         service = new EmissionService(emissions, mock(CrwEmissionMemberRepo.class), new Pain008Writer(),
