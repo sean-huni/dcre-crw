@@ -83,31 +83,25 @@ public class EmissionService {
      * @return number of pain.008 FILES emitted for the run date (batch grain).
      */
     /**
-     * A-76 (SCRUM-107): the due queries read three tables owned by OTHER services, and none of
-     * them exists on a freshly reset database until those services have run. Every CRW window
-     * then died with {@code relation "cde_schedule" does not exist} and burned its relaunch
-     * budget, when the correct answer is simply that nothing is due. Since R-37 was amended to gate DC
-     * DAG_COMPLETE on a CRW emission, that failure also blocked every collections arrival from
-     * ever completing.
+     * A-76, then A-78 (SCRUM-107). The due queries read tables owned by FOUR other services, and
+     * a freshly reset database has none of them until those services have run. Every CRW window
+     * died with {@code relation "cde_schedule" does not exist}, and later
+     * {@code relation "ais_verdict" does not exist}, burning its relaunch budget when the
+     * correct answer was simply that nothing is due. Since R-37 was amended to gate DC
+     * DAG_COMPLETE on a CRW emission, that also blocked every collections arrival from ever
+     * completing.
      *
-     * <p>Degrades to a WARN and an empty due-set, per the bootstrap-ordering standard: a
-     * dependency that has not bootstrapped yet is not a failure, it is no work. Scoped to this
-     * ONE table by name, so a genuine typo or a dropped table elsewhere still fails loudly.
+     * <p>A-76 guarded the due-set as a BLOCK and returned empty if any peer table was missing.
+     * A-78 replaced that with per-arm composition in {@link DueArms}, because the block guard is
+     * wrong in the direction that does not announce itself: a collections-only cluster never
+     * runs AIS, so {@code ais_verdict} never exists, and the widened block guard would have
+     * reported clean windows while emitting nothing for DC forever.
+     *
+     * <p>So there is no guard here any more. An arm whose tables are absent is left out of the
+     * SQL and the other arm still runs; with neither arm resolvable the queries return empty and
+     * DueArms logs the bootstrap WARN once per query.
      */
-    private boolean dueDependenciesMissing() {
-        if (emissions.dueQueryTablesExist()) {
-            return false;
-        }
-        log.warn("the due-query peer tables (cde_schedule, validation_log, tx_header) are not all"
-                + " present yet: CDE/CTV/CRR have not run on this database, so nothing is due."
-                + " Bootstrap ordering, not a failure.");
-        return true;
-    }
-
     public int emitDue(final LocalDate runDate) {
-        if (dueDependenciesMissing()) {
-            return 0;
-        }
         warnFutured(emissions.findFuturedCounts(runDate));
         return emitAll(emissions.findDueArrivals(runDate), runDate);
     }
@@ -118,9 +112,6 @@ public class EmissionService {
      * WARNs are client-scoped so parallel lanes never duplicate them.
      */
     public int emitDue(final LocalDate runDate, final String client) {
-        if (dueDependenciesMissing()) {
-            return 0;
-        }
         warnFutured(emissions.findFuturedCounts(runDate, client));
         return emitAll(emissions.findDueArrivals(runDate, client), runDate);
     }
@@ -128,14 +119,12 @@ public class EmissionService {
     /**
      * Lane universe for the partitioner: distinct clients with work due on the run date.
      *
-     * <p>A-76: guarded like the two emitDue paths. This is the entry point the PARTITIONED job
-     * hits FIRST, so guarding only emitDue left the identical failure reachable and the window
-     * still died on a fresh database. Third site of the same shape; the class is now closed.
+     * <p>A-76 guarded this like the two emitDue paths, because it is the entry point the
+     * PARTITIONED job hits FIRST and guarding only emitDue left the window still dying on a
+     * fresh database. A-78 moved that concern into the query composition itself, so all three
+     * sites are covered by construction rather than by three remembered guards.
      */
     public List<String> dueClients(final LocalDate runDate) {
-        if (dueDependenciesMissing()) {
-            return List.of();
-        }
         return emissions.findDueClients(runDate);
     }
 

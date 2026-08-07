@@ -11,9 +11,9 @@
       longer report complete before CRW has written anything (R-37 as amended).
 
       Published as a view for the same reason prg_report_due and prg_sla_pending are:
-      CRW owns crw_emission, crw_emission_group, cde_schedule and validation_log, and
-      the completeness rule belongs next to them. AGT reading crw_emission.state
-      directly would couple it to a literal this repo treats as provisional.
+      the completeness RULE is CRW's, so it belongs next to the crw_emission tables
+      that decide it. AGT reading crw_emission.state directly would couple it to a
+      literal this repo treats as provisional.
 
       OWED, not EMITTED. That distinction is the whole point, and getting it wrong
       strands arrivals:
@@ -27,26 +27,45 @@
           batches still undelivered;
         - a multi-process-date arrival owes until the futured remainder has emitted
           too, which is a later run_date and a different group entirely.
+
+      The view spans tables owned by four services in the shared dcre_col: tx_header
+      (CRR), validation_log (CTV), cde_schedule (CDE) and crw_emission/_group (CRW).
+      Which of them exist depends on what has run, so the changeset is guarded and
+      RETRIED rather than skipped once; see A-79 on the changeset below. The
+      predicate itself is exercised against a real database by EmissionOwedViewIT,
+      which reads the view body out of THIS file so the two cannot drift.
     -->
-    <changeSet id="001-crw-emission-owed-view" author="dcre">
-        <!--
-          The view spans tables owned by four services in the shared dcre_col:
-          tx_header (CRR), validation_log (CTV), cde_schedule (CDE) and
-          crw_emission/_group (CRW). All four exist in the real database; in CRW's
-          own isolated Testcontainers database only CRW's do, so the changeset
-          MARK_RANs there rather than failing the build. The predicate itself is
-          exercised against a real database by AGT's EmissionOwedViewIT, which
-          creates all four tables and this view.
-        -->
-        <preConditions onFail="MARK_RAN">
-            <not><viewExists viewName="crw_emission_owed"/></not>
+    <!--
+      A-79 (2026-08-07): the id changed because the ORIGINAL changeset,
+      001-crw-emission-owed-view, used onFail="MARK_RAN" for these same
+      preconditions. MARK_RAN does not mean "skip", it means "record as applied,
+      permanently". CRW's window job runs every 10 seconds from cluster start and
+      so reaches Liquibase long before the first DC arrival makes CDE create
+      cde_schedule: on dcre_col the changeset MARK_RANed on the very first window
+      and the view was never created for the life of that database. AGT then fails
+      closed to OWED on the missing relation, which is the right direction and
+      makes it a SILENT permanent hang: every collections arrival sits in
+      DAG_RUNNING forever with no error anywhere.
+
+      A dependency that has not bootstrapped yet is not work already done. CONTINUE
+      is the retryable skip: skip this run, record NOTHING, re-evaluate next
+      startup. The identity moves to a new id so databases already carrying the
+      MARK_RAN row reconsider it; that orphan row is inert.
+
+      replaceIfExists, so a database where the original changeset did execute
+      converges instead of failing on an existing view.
+    -->
+    <changeSet id="002-crw-emission-owed-view-retryable" author="dcre">
+        <preConditions onFail="CONTINUE"
+                       onFailMessage="crw_emission_owed not created yet: CRR/CTV/CDE have not all
+                       run on this database. Bootstrap ordering, not a failure; retried next run.">
             <tableExists tableName="tx_header"/>
             <tableExists tableName="validation_log"/>
             <tableExists tableName="cde_schedule"/>
             <tableExists tableName="crw_emission_group"/>
         </preConditions>
 
-        <createView viewName="crw_emission_owed" fullDefinition="false">
+        <createView viewName="crw_emission_owed" replaceIfExists="true" fullDefinition="false">
             SELECT h.arrival_id AS arrival_id,
                    (
                      EXISTS (
