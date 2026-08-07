@@ -125,8 +125,17 @@ public class EmissionService {
         return emitAll(emissions.findDueArrivals(runDate, client), runDate);
     }
 
-    /** Lane universe for the partitioner: distinct clients with work due on the run date. */
+    /**
+     * Lane universe for the partitioner: distinct clients with work due on the run date.
+     *
+     * <p>A-76: guarded like the two emitDue paths. This is the entry point the PARTITIONED job
+     * hits FIRST, so guarding only emitDue left the identical failure reachable and the window
+     * still died on a fresh database. Third site of the same shape; the class is now closed.
+     */
     public List<String> dueClients(final LocalDate runDate) {
+        if (dueDependenciesMissing()) {
+            return List.of();
+        }
         return emissions.findDueClients(runDate);
     }
 
