@@ -82,6 +82,19 @@ class MissingScheduleTableIT extends CrwTestcontainersBase {
         jdbc.execute("DROP TABLE IF EXISTS " + table + " CASCADE");
     }
 
+    /**
+     * The partitioned job calls this BEFORE emitDue, so guarding only emitDue left the window
+     * still dying on a fresh database. Verified in-cluster: the pod ran the fixed image and
+     * still failed, which is what exposed the third site.
+     */
+    @Test
+    void theLaneUniverseQueryDegradesToo() {
+        dropWithDependents("cde_schedule");
+        assertEquals(0, assertDoesNotThrow(() -> emissions.dueClients(LocalDate.now()),
+                        "dueClients is the partitioner's first call and must not fail the window")
+                .size(), "no lanes when nothing can be due");
+    }
+
     private void restoreAllPeerTables() {
         restoreTheTable();
         jdbc.execute("CREATE TABLE IF NOT EXISTS validation_log ("
