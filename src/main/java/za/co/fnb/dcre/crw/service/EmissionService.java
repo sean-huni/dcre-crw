@@ -82,7 +82,32 @@ public class EmissionService {
      *
      * @return number of pain.008 FILES emitted for the run date (batch grain).
      */
+    /**
+     * A-76 (SCRUM-107): the due queries read three tables owned by OTHER services, and none of
+     * them exists on a freshly reset database until those services have run. Every CRW window
+     * then died with {@code relation "cde_schedule" does not exist} and burned its relaunch
+     * budget, when the correct answer is simply that nothing is due. Since R-37 was amended to gate DC
+     * DAG_COMPLETE on a CRW emission, that failure also blocked every collections arrival from
+     * ever completing.
+     *
+     * <p>Degrades to a WARN and an empty due-set, per the bootstrap-ordering standard: a
+     * dependency that has not bootstrapped yet is not a failure, it is no work. Scoped to this
+     * ONE table by name, so a genuine typo or a dropped table elsewhere still fails loudly.
+     */
+    private boolean dueDependenciesMissing() {
+        if (emissions.dueQueryTablesExist()) {
+            return false;
+        }
+        log.warn("the due-query peer tables (cde_schedule, validation_log, tx_header) are not all"
+                + " present yet: CDE/CTV/CRR have not run on this database, so nothing is due."
+                + " Bootstrap ordering, not a failure.");
+        return true;
+    }
+
     public int emitDue(final LocalDate runDate) {
+        if (dueDependenciesMissing()) {
+            return 0;
+        }
         warnFutured(emissions.findFuturedCounts(runDate));
         return emitAll(emissions.findDueArrivals(runDate), runDate);
     }
@@ -93,6 +118,9 @@ public class EmissionService {
      * WARNs are client-scoped so parallel lanes never duplicate them.
      */
     public int emitDue(final LocalDate runDate, final String client) {
+        if (dueDependenciesMissing()) {
+            return 0;
+        }
         warnFutured(emissions.findFuturedCounts(runDate, client));
         return emitAll(emissions.findDueArrivals(runDate, client), runDate);
     }

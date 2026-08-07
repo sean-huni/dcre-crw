@@ -126,6 +126,21 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
     List<FuturedCountRow> findFuturedCounts(@Param("runDate") LocalDate runDate);
 
     /**
+     * A-76 (SCRUM-107): are ALL the peer tables the due queries read actually present?
+     *
+     * <p>cde_schedule is CDE's, validation_log is CTV's and tx_header is CRR's, and on a freshly
+     * reset database NONE of them exists until those services have run. Guarding only
+     * cde_schedule, as the first cut of this fix did, leaves the identical failure reachable
+     * through the other two: the test that caught it died on validation_log.
+     *
+     * <p>Probed BY NAME rather than by catching a SQL error, so a genuine typo or a dropped
+     * table elsewhere still fails loudly instead of being silently read as "nothing due".
+     */
+    @Query("SELECT count(*) = 3 FROM information_schema.tables"
+            + " WHERE table_name IN ('cde_schedule', 'validation_log', 'tx_header')")
+    boolean dueQueryTablesExist();
+
+    /**
      * Client-scoped futured counts for a lane run (SCRUM-55 Feature 2): each
      * lane warns only its own client's warehoused rows so parallel lanes never
      * duplicate an R-38 WARN.
