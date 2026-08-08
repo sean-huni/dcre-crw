@@ -9,31 +9,31 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * The due-path queries, as a repository fragment rather than {@code @Query} annotations (A-78).
+ * The due-path queries, as a repository fragment rather than {@code @Query} annotations.
  *
- * <p>They are the only queries in CRW that span BOTH the DC and pay arms, so they are the only
- * ones whose SQL has to be composed from the arms this database can actually resolve. Everything
- * else in {@link CrwEmissionRepo} touches CRW's own tables and stays declarative.
+ * <p>They are the queries whose SQL is assembled from a shared {@link DueSql} fragment, because
+ * the member-row predicate is one fact serving four statements. Everything else in
+ * {@link CrwEmissionRepo} touches CRW's own tables and stays declarative.
  *
- * <p>Signatures are unchanged from the annotated versions they replace, so callers and their
- * tests are untouched.
+ * <p>Every statement reads {@code cde_schedule}, which CDE owns, and NONE of them guards its
+ * presence: a missing schedule table fails the window loudly rather than reporting a clean,
+ * empty one forever. {@link DueSql} carries the A-76/A-78 reasoning behind that.
  */
 public interface CrwDueQueries {
 
-    /** Arrivals with work due on the run date, either arm, ordered by arrival id. */
+    /** Arrivals with collections work due on the run date, ordered by arrival id. */
     List<DueArrivalRow> findDueArrivals(LocalDate runDate);
 
     /**
      * One client lane's due parents, FIFO by eligibility order: tx_header insertion order
-     * (created_at), arrival id as the deterministic tie-break. The ordering spans BOTH arms, so
-     * DC and pay parents interleave in one FIFO sequence (SCRUM-69).
+     * (created_at), arrival id as the deterministic tie-break.
      */
     List<DueArrivalRow> findDueArrivals(LocalDate runDate, String client);
 
-    /** The lane universe for the partitioner: distinct clients with work due, either arm. */
+    /** The lane universe for the partitioner: distinct clients with work due. */
     List<String> findDueClients(LocalDate runDate);
 
-    /** Warehoused counts per (arrival, process date) past the run date. DC arm only. */
+    /** Warehoused counts per (arrival, process date) past the run date. */
     List<FuturedCountRow> findFuturedCounts(LocalDate runDate);
 
     /** Client-scoped warehoused counts, so parallel lanes never duplicate an R-38 WARN. */

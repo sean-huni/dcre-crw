@@ -80,26 +80,16 @@ public class EmissionService {
      * job goes through the client-scoped overload per lane (SCRUM-55
      * Feature 2).
      *
+     * <p>The due queries read {@code cde_schedule}, {@code validation_log}, {@code tx_entry} and
+     * {@code tx_header}, all owned by other services, and a freshly reset database has none of
+     * them until those services have run. That is NOT guarded (A-76, A-78): a missing peer table
+     * throws and the window fails. The alternative was tried and is worse in the direction that
+     * does not announce itself, because a guarded due-set reports clean, empty windows while
+     * emitting nothing, and since R-37 was amended to gate DAG_COMPLETE on a CRW emission that
+     * leaves every collections arrival in DAG_RUNNING forever with no error anywhere. See
+     * {@link za.co.fnb.dcre.crw.data.repo.CrwDueQueries} and the DueSql javadoc behind it.
+     *
      * @return number of pain.008 FILES emitted for the run date (batch grain).
-     */
-    /**
-     * A-76, then A-78 (SCRUM-107). The due queries read tables owned by FOUR other services, and
-     * a freshly reset database has none of them until those services have run. Every CRW window
-     * died with {@code relation "cde_schedule" does not exist}, and later
-     * {@code relation "ais_verdict" does not exist}, burning its relaunch budget when the
-     * correct answer was simply that nothing is due. Since R-37 was amended to gate DC
-     * DAG_COMPLETE on a CRW emission, that also blocked every collections arrival from ever
-     * completing.
-     *
-     * <p>A-76 guarded the due-set as a BLOCK and returned empty if any peer table was missing.
-     * A-78 replaced that with per-arm composition in {@link DueArms}, because the block guard is
-     * wrong in the direction that does not announce itself: a collections-only cluster never
-     * runs AIS, so {@code ais_verdict} never exists, and the widened block guard would have
-     * reported clean windows while emitting nothing for DC forever.
-     *
-     * <p>So there is no guard here any more. An arm whose tables are absent is left out of the
-     * SQL and the other arm still runs; with neither arm resolvable the queries return empty and
-     * DueArms logs the bootstrap WARN once per query.
      */
     public int emitDue(final LocalDate runDate) {
         warnFutured(emissions.findFuturedCounts(runDate));
@@ -119,10 +109,9 @@ public class EmissionService {
     /**
      * Lane universe for the partitioner: distinct clients with work due on the run date.
      *
-     * <p>A-76 guarded this like the two emitDue paths, because it is the entry point the
-     * PARTITIONED job hits FIRST and guarding only emitDue left the window still dying on a
-     * fresh database. A-78 moved that concern into the query composition itself, so all three
-     * sites are covered by construction rather than by three remembered guards.
+     * <p>This is the entry point the PARTITIONED job hits FIRST, so it is the site a fresh
+     * database reaches before either emitDue overload. It reads the same peer tables and, like
+     * them, does not guard their presence.
      */
     public List<String> dueClients(final LocalDate runDate) {
         return emissions.findDueClients(runDate);

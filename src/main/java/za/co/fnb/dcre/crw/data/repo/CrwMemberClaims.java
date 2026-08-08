@@ -4,14 +4,13 @@ import java.time.LocalDate;
 import java.util.UUID;
 
 /**
- * A-78: the member claim is the FOURTH site carrying the two-arm UNION, after the due queries,
- * the plan totals and the batch boundaries.
+ * The member claim: the FOURTH site reading the shared eligible-row predicate, after the due
+ * queries, the plan totals and the batch boundaries.
  *
  * <p>It was found by the compiler when the shared fragment moved, not by inspection, which is
- * the point: three sites had been enumerated by hand and this was not among them. The
- * service-level test in {@code SingleArmBootstrapIT} reaches it, so a guard applied only to the
- * query sites would have moved the crash from due detection into planning rather than removing
- * it.
+ * the point: three sites had been enumerated by hand and this was not among them. Anything
+ * applied to the query sites alone would have moved a failure from due detection into planning
+ * rather than dealing with it.
  */
 public interface CrwMemberClaims {
 

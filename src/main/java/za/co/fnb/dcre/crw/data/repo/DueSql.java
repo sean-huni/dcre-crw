@@ -1,94 +1,59 @@
 package za.co.fnb.dcre.crw.data.repo;
 
 /**
- * The due-path SQL, split into per-arm fragments (A-78).
+ * The due-path SQL. ONE lane, so one plain statement per query.
  *
- * <p>These are the SAME predicates the queries carried as one UNION before; they are separated
- * only so an arm whose tables have not bootstrapped can be left out of the composed statement.
- * When both arms are resolvable the composed SQL is identical to the original, UNION included,
- * so the emission semantics are unchanged.
+ * <p>CRW emits pain.008 for COLLECTIONS only. The payments lane belongs to PRW, in the payments
+ * bounded context, and the arm CRW used to carry for it is gone: it selected on
+ * {@code tx_header.flow = 'PAY'} and counted rows in {@code ais_verdict}, a table NO changelog in
+ * the estate creates. On a clean v1 database that arm could only ever have dropped out of the
+ * UNION, so a CRW window would have reported a successful run having emitted nothing.
+ *
+ * <p><b>No presence guard, deliberately (A-76, A-78).</b> These statements name
+ * {@code cde_schedule}, {@code validation_log}, {@code tx_entry} and {@code tx_header}, all owned
+ * by other services, and PostgreSQL resolves every relation a statement names, so a missing one
+ * throws. That is now the intended behaviour and nothing here catches it.
+ *
+ * <p>A-78 tolerated a missing table only because there were TWO arms: leaving one out still left
+ * the other running, so a collections-only cluster with no {@code ais_verdict} kept emitting DC.
+ * With a single arm that reasoning inverts. Guarding the whole due-set is exactly the A-76 shape
+ * this codebase already ruled WORSE than a crash: it would report clean, empty windows forever
+ * while the schedule table stayed absent, and since R-37 was amended to gate DAG_COMPLETE on a
+ * CRW emission, every collections arrival would sit in DAG_RUNNING with no error anywhere. A
+ * crash is loud and burns a relaunch budget until somebody looks; a permanent silent zero is not
+ * loud and nobody ever looks. So a missing {@code cde_schedule} fails the window.
  */
 final class DueSql {
 
-    /**
-     * SCRUM-69 pay-arm gates, SINGLE SOURCE for every pay-eligibility arm (review B1/M1).
-     * A flow='PAY' parent is due when:
-     * - M1: the AIS verdict set COVERS the PASS set (count comparison, not bare EXISTS): a
-     *   slice-committing mid-run AIS or an AIS that died stays fail-closed until the last
-     *   verdict lands;
-     * - at least one PASS row exists (nothing validated = nothing to emit);
-     * - the run date is on/after the ingest day (pay rows are immediate);
-     * - B1: NO emission exists for a STRICTLY EARLIER run date. Strictly earlier keeps the
-     *   same-day crash-resume visible (day-1 rows never exclude a day-1 re-poll) while a fully
-     *   or partially emitted day-1 parent is never due again on day 2 (recovery re-runs day 1).
-     */
-    static final String PAY_DUE_GATES = """
-            h.flow = 'PAY'
-              AND (SELECT count(*) FROM ais_verdict av WHERE av.arrival_id = h.arrival_id)
-                  >= (SELECT count(*) FROM validation_log vp WHERE vp.arrival_id = h.arrival_id
-                      AND vp.outcome = 'PASS')
-              AND EXISTS (SELECT 1 FROM validation_log vp WHERE vp.arrival_id = h.arrival_id
-                          AND vp.outcome = 'PASS')
-              AND :runDate >= CAST(h.created_at AS DATE)
-              AND NOT EXISTS (SELECT 1 FROM crw_emission e
-                              WHERE e.arrival_id = h.arrival_id AND e.run_date < :runDate)""";
-
-    /** Pay-flow member rows: the parent's PASS rows joined to the spine, no cde reference. */
-    static final String PAY_MEMBER_ROWS = """
-            FROM tx_header h
-                JOIN validation_log v ON v.arrival_id = h.arrival_id AND v.outcome = 'PASS'
-                JOIN tx_entry t ON t.arrival_id = h.arrival_id AND t.sequence = v.sequence
-                WHERE h.arrival_id = :arrivalId AND
-            """ + PAY_DUE_GATES;
-
-    /** DC member rows: the parent's PASS rows scheduled for the run date. */
-    static final String DC_MEMBER_ROWS = """
+    /** Member rows: the parent's PASS rows scheduled for the run date. */
+    static final String MEMBER_ROWS = """
             FROM cde_schedule s
                 JOIN validation_log v ON v.arrival_id = s.arrival_id AND v.sequence = s.sequence
                     AND v.outcome = 'PASS'
                 JOIN tx_entry t ON t.arrival_id = s.arrival_id AND t.sequence = s.sequence
                 WHERE s.process_date = :runDate AND s.arrival_id = :arrivalId""";
 
-    static final String DC_ARRIVALS = """
+    static final String ARRIVALS = """
             SELECT DISTINCT s.arrival_id, h.initg_pty, h.msg_id
             FROM cde_schedule s
             JOIN tx_header h ON h.arrival_id = s.arrival_id
             WHERE s.process_date = :runDate""";
 
-    static final String PAY_ARRIVALS = """
-            SELECT h.arrival_id, h.initg_pty, h.msg_id
-            FROM tx_header h
-            WHERE
-            """ + PAY_DUE_GATES;
-
-    static final String DC_ARRIVALS_FOR_CLIENT = """
+    static final String ARRIVALS_FOR_CLIENT = """
             SELECT DISTINCT s.arrival_id, h.initg_pty, h.msg_id, h.created_at
             FROM cde_schedule s
             JOIN tx_header h ON h.arrival_id = s.arrival_id
             WHERE s.process_date = :runDate AND h.initg_pty = :client""";
 
-    static final String PAY_ARRIVALS_FOR_CLIENT = """
-            SELECT h.arrival_id, h.initg_pty, h.msg_id, h.created_at
-            FROM tx_header h
-            WHERE h.initg_pty = :client AND
-            """ + PAY_DUE_GATES;
-
-    static final String DC_CLIENTS = """
+    static final String CLIENTS = """
             SELECT DISTINCT h.initg_pty
             FROM cde_schedule s
             JOIN tx_header h ON h.arrival_id = s.arrival_id
             WHERE s.process_date = :runDate""";
 
-    static final String PAY_CLIENTS = """
-            SELECT h.initg_pty
-            FROM tx_header h
-            WHERE
-            """ + PAY_DUE_GATES;
-
     /**
      * Warehoused (futured) counts per (arrival, process date) past the run date (R-38 at scale):
-     * pure aggregate, never the per-tx fanout that exceeded the sql memory budget. DC only, since
-     * pay rows are never warehoused.
+     * pure aggregate, never the per-tx fanout that exceeded the sql memory budget.
      */
     static final String FUTURED_COUNTS = """
             SELECT s.arrival_id, s.process_date, count(*) AS futured

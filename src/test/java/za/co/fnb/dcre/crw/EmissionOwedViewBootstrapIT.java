@@ -32,9 +32,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * database. Observed on dcre_col:
  *
  * <pre>
- * id                          filename                                      exectype
- * 001-crw-emission-owed-view  db/changelog/2026/08/001-emission-owed-view.xml  MARK_RAN
+ * id                          filename                                          exectype
+ * 001-crw-emission-owed-view  db/changelog/2026/08/001-emission-owed-view.xml    MARK_RAN
  * </pre>
+ *
+ * <p>The v1 baseline carries the fixed changeset at
+ * {@code db/changelog/2026/08/003-emission-owed-view.xml}; the ids and filenames above are the
+ * pre-v1 ones the defect was observed under.
  *
  * <p>AGT's {@code CollectionsReadRepo.emissionOwedFor} fails closed to OWED on a structural
  * error (42P01), which is the correct direction and turns this into a silent permanent hang:
@@ -43,9 +47,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>A dependency that has not bootstrapped yet is NOT work already done. The retryable skip is
  * {@code onFail="CONTINUE"}: skip this run, record nothing, re-evaluate next startup.
  *
- * <p>Nothing caught this because {@code CrwTestcontainersBase.ensureSpineTables} creates all
- * five peer tables for every other suite, so no fixture in the repo could express a database
- * where they are absent. This one runs Liquibase itself, against its own empty database.
+ * <p>Nothing caught this because {@code CrwTestcontainersBase.ensureSpineTables} creates every
+ * peer table for every other suite, so no fixture in the repo could express a database where
+ * they are absent. This one runs Liquibase itself, against its own empty database.
  */
 class EmissionOwedViewBootstrapIT extends CrwTestcontainersBase {
 
@@ -60,7 +64,6 @@ class EmissionOwedViewBootstrapIT extends CrwTestcontainersBase {
     private static final String[] PEER_DDL = {
             "CREATE TABLE IF NOT EXISTS tx_header (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
                     + " arrival_id UUID UNIQUE, msg_id VARCHAR(35), initg_pty VARCHAR(35),"
-                    + " flow VARCHAR(8) NOT NULL DEFAULT 'COL',"
                     + " created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
             "CREATE TABLE IF NOT EXISTS validation_log (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
                     + " arrival_id UUID, sequence INT, outcome VARCHAR(32), UNIQUE (arrival_id, sequence))",

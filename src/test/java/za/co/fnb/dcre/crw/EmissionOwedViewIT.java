@@ -19,9 +19,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>The view body is READ OUT OF THE CHANGESET rather than copied here. A copy
  * would be a second home for one fact, and the copy is the one that stays right
- * while the shipped SQL drifts. The changeset itself MARK_RANs in this repo's
- * migration (it needs four tables owned by other services), so this test creates
- * those tables and then applies the very same view definition.
+ * while the shipped SQL drifts. The changeset needs four tables owned by other
+ * services and so may not have run in this repo's own migration, therefore this
+ * test creates those tables and then applies the very same view definition.
  *
  * <p>The negative case that matters most is {@code MATERIALIZED}: a planned but
  * unpublished batch. Only that assertion catches a predicate that tests for row
@@ -29,7 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class EmissionOwedViewIT extends CrwTestcontainersBase {
 
-    private static final String CHANGESET = "db/changelog/2026/08/001-emission-owed-view.xml";
+    private static final String CHANGESET = "db/changelog/2026/08/003-emission-owed-view.xml";
 
     /** The view SELECT exactly as it ships, pulled from the changeset's createView body. */
     private static String shippedViewBody() throws Exception {

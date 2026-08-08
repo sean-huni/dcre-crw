@@ -18,11 +18,8 @@ public interface CrwEmissionRepo extends CrudRepository<CrwEmissionEntity, UUID>
      * ONE (arrival, process date) group's warehoused rows, for per-tx R-38 WARN detail on small
      * groups.
      *
-     * <p>The last statement in CRW naming a peer table that is NOT composed per arm (A-78). It is
-     * safe because it is unreachable without one: the only caller iterates the groups returned by
-     * findFuturedCounts, which is DC-arm-gated and returns empty when cde_schedule is absent, so
-     * there is no group to ask about. That is a structural guarantee, not proximity. Calling it
-     * directly on a database without cde_schedule WILL throw.
+     * <p>Like every other statement in CRW that names {@code cde_schedule}, this one throws if
+     * CDE has not bootstrapped yet, and that is intended (see {@link CrwDueQueries}).
      */
     @Query(value = """
             SELECT t.arrival_id, t.sequence, t.e2e, s.process_date
