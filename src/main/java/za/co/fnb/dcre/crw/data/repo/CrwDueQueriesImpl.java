@@ -40,7 +40,7 @@ public class CrwDueQueriesImpl implements CrwDueQueries {
 
     @Override
     public List<String> findDueClients(final LocalDate runDate) {
-        return jdbc.query(DueSql.CLIENTS + "\nORDER BY initg_pty", params(runDate), new ClientRowMapper());
+        return jdbc.query(DueSql.CLIENTS + "\nORDER BY client", params(runDate), new ClientRowMapper());
     }
 
     @Override

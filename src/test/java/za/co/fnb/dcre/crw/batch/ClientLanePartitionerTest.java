@@ -17,9 +17,14 @@ import static org.mockito.Mockito.when;
  * SCRUM-55 review fix: lanes are keyed by BOUNDED index (lane-N), never by
  * the unbounded comma-joined client tokens. Worker step executions persist
  * as emitWorkerStep:&lt;key&gt; into CRW_BATCH_STEP_EXECUTION.STEP_NAME
- * (VARCHAR(100)); with initg_pty at VARCHAR(35), 3+ long clients in one lane
- * overflowed the column at runtime. The client list travels in the lane's
- * ExecutionContext instead (SHORT_CONTEXT is VARCHAR(2500)).
+ * (VARCHAR(100)); 3+ long clients in one lane overflowed the column at
+ * runtime. The client list travels in the lane's ExecutionContext instead
+ * (SHORT_CONTEXT is VARCHAR(2500)).
+ *
+ * <p>35 is still the worst case after A-43 made client_token (VARCHAR(16))
+ * the authority, because initg_pty (VARCHAR(35)) remains the fallback for an
+ * arrival with no R-31 filename token. The bound is deliberately taken from
+ * the widest column the lane key can carry, not from the usual one.
  */
 class ClientLanePartitionerTest {
 
@@ -34,7 +39,7 @@ class ClientLanePartitionerTest {
 
     @Test
     void lanesAreKeyedByBoundedIndexNeverByClientTokens() {
-        // 15 due clients at initg_pty's VARCHAR(35) ceiling: token-keyed step
+        // 15 due clients at the fallback initg_pty's VARCHAR(35) ceiling: token-keyed step
         // names would exceed STEP_NAME VARCHAR(100) from 3 clients per lane.
         List<String> clients = IntStream.range(0, 15)
                 .mapToObj(i -> ("FNBLONG%02d".formatted(i) + "X".repeat(35)).substring(0, 35))

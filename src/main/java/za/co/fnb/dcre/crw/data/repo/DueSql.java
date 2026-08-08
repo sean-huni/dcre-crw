@@ -25,6 +25,41 @@ package za.co.fnb.dcre.crw.data.repo;
  */
 final class DueSql {
 
+    /**
+     * The outbound client of a {@code tx_header} row: the R-31 filename token when the arrival
+     * carried one, else the mandatory copybook {@code destination_id} (A-43, ruled 2026-08-08).
+     *
+     * <p>{@code client_token} is the R-31 filename token AGT already matched against the
+     * drop-zone directory, so it is the "resolved from trusted route/profile config" identity
+     * R-16 demands; {@code initg_pty} is an unresolved header value whose value domain is still
+     * open as A-19. {@code initg_pty} is the FALLBACK rather than the source because
+     * {@code client_token} is nullable by design (a job launched outside AGT carries no original
+     * filename) while {@code crw_emission_group.client} is NOT NULL, so a bare swap would turn a
+     * silent mis-selection into an insert failure. This is the shape {@code mandates/mrw}
+     * ({@code ManRequestHeaderView.client()}) already chose and documented; copying the sibling
+     * is the rule.
+     *
+     * <p>Both columns hold the same 7-character value on every arrival that can reach CRW
+     * through AGT, because {@code crr HeaderService} throws {@code FileFatalException} when the
+     * filename token differs from the header {@code destination_id}. This is a rename of the
+     * authority, not a change of the emitted bytes.
+     *
+     * <p>THIS IS THE SINGLE POINT at which the outbound client is resolved, deliberately. The
+     * value reaches three places from one row: {@code crw_emission_group.client}, the outbound
+     * file NAME, and the per-client output DIRECTORY. Applying the authority at the column write
+     * instead would move the file name while leaving the directory on the old source, and
+     * {@code ExchangeLayout.resolve} cannot object to a directory that is configured, so the two
+     * would disagree silently on the first day they differed.
+     *
+     * <p>ASSEMBLY TRAP, and it fired here on 2026-08-08: a Java text block strips trailing
+     * whitespace from every line, so {@code ...:runDate AND """ + CLIENT_EXPR} concatenates to
+     * {@code ANDCOALESCE(...)} and the statement is rejected as bad grammar. Every join of a
+     * text block to this constant states its separator OUTSIDE the block
+     * ({@code """ + " AND " + CLIENT_EXPR}), and {@code DueSqlAssemblyTest} asserts the
+     * assembled statements rather than trusting the shape to survive an edit.
+     */
+    static final String CLIENT_EXPR = "COALESCE(h.client_token, h.initg_pty)";
+
     /** Member rows: the parent's PASS rows scheduled for the run date. */
     static final String MEMBER_ROWS = """
             FROM cde_schedule s
@@ -33,20 +68,21 @@ final class DueSql {
                 JOIN tx_entry t ON t.arrival_id = s.arrival_id AND t.sequence = s.sequence
                 WHERE s.process_date = :runDate AND s.arrival_id = :arrivalId""";
 
-    static final String ARRIVALS = """
-            SELECT DISTINCT s.arrival_id, h.initg_pty, h.msg_id
+    static final String ARRIVALS = "SELECT DISTINCT s.arrival_id, " + CLIENT_EXPR + """
+             AS client, h.msg_id
             FROM cde_schedule s
             JOIN tx_header h ON h.arrival_id = s.arrival_id
             WHERE s.process_date = :runDate""";
 
-    static final String ARRIVALS_FOR_CLIENT = """
-            SELECT DISTINCT s.arrival_id, h.initg_pty, h.msg_id, h.created_at
+    static final String ARRIVALS_FOR_CLIENT = "SELECT DISTINCT s.arrival_id, " + CLIENT_EXPR + """
+             AS client, h.msg_id, h.created_at
             FROM cde_schedule s
             JOIN tx_header h ON h.arrival_id = s.arrival_id
-            WHERE s.process_date = :runDate AND h.initg_pty = :client""";
+            WHERE s.process_date = :runDate"""
+            + " AND " + CLIENT_EXPR + " = :client";
 
-    static final String CLIENTS = """
-            SELECT DISTINCT h.initg_pty
+    static final String CLIENTS = "SELECT DISTINCT " + CLIENT_EXPR + """
+             AS client
             FROM cde_schedule s
             JOIN tx_header h ON h.arrival_id = s.arrival_id
             WHERE s.process_date = :runDate""";
@@ -71,7 +107,9 @@ final class DueSql {
             JOIN tx_header h ON h.arrival_id = s.arrival_id
             JOIN validation_log v ON v.arrival_id = s.arrival_id AND v.sequence = s.sequence
                 AND v.outcome = 'PASS'
-            WHERE s.process_date > :runDate AND h.initg_pty = :client
+            WHERE s.process_date > :runDate"""
+            + " AND " + CLIENT_EXPR + " = :client\n"
+            + """
             GROUP BY s.arrival_id, s.process_date
             ORDER BY s.arrival_id, s.process_date""";
 
