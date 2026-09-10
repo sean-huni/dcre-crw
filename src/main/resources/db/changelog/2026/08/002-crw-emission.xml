@@ -1,0 +1,192 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog
+        xmlns="http://www.liquibase.org/xml/ns/dbchangelog"
+        xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
+        http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
+
+    <!-- ============================================================================
+         CRW v1 BASELINE, part 2 of 3: the CRW domain schema.
+
+         THIS IS THE VERSION 1 BASELINE. Every DCRE database is dropped and recreated
+         at the v1 cutover, so this changelog only ever runs against an EMPTY schema.
+         That is why the usual re-run guards are absent, and their absence is
+         deliberate rather than an oversight:
+
+           - no IF-NOT-EXISTS on any CREATE. The previous 001-crw changeset carried
+             them because a pod SIGKILLed mid-migration could leave the file
+             half-applied. On an empty schema every CREATE here is the first and only
+             one, and a guard that cannot fire would silently skip real work if the
+             assumption ever changed.
+           - no onFail="MARK_RAN" preconditions. The previous 003-split changesets
+             each guarded an object created by an earlier changelog on an already
+             migrated database. There is no such database. MARK_RAN does not mean
+             "skip", it means "record as applied, permanently" (A-79), so a guard
+             that cannot fire is not free: it is a latent silent skip.
+           - no additive retrofit. 003-split added six columns to crw_emission,
+             dropped the pre-split unique constraint and backfilled legacy rows into
+             groups. All three exist only to move an OLD database to the split shape.
+             The v1 tables below are declared in their FINAL shape directly, so the
+             INSERT..SELECT backfill (the last data-modifying raw-SQL body in this
+             repo) is gone with the legacy rows it converted.
+
+         Pure typed tags, no raw-SQL body: the previous 001-crw hid both crw_emission
+         and crw_emission_member inside a raw-SQL body, so the cleanout audit's
+         relation extractor could not see either table, and the DDL was pinned to one
+         dialect.
+
+         CRW is the SINGLE WRITER of all three tables (R-04). The emission snapshot is
+         immutable per R-24; identity is the FULL business tuple
+         (arrival_id, run_date, batch_ordinal) at batch grain (SCRUM-55), never a
+         subset of it.
+
+         Column naming: no column repeats its own table's name. emission_id on
+         crw_emission_member and group_id on crw_emission name their TARGET table and
+         are the exempt FK case.
+         ============================================================================ -->
+
+    <!-- Parent grain (SCRUM-55): one row per (arrival, run date) plan. The plan is
+         frozen at claim time; expected_batch_count is what crw_emission_owed counts
+         VISIBLE batches against, so an arrival owes Fintegrate until EVERY planned
+         batch is out, not until the first one is. -->
+    <changeSet id="crw-v1-emission-group" author="dcre">
+        <createTable tableName="crw_emission_group">
+            <column name="id" type="UUID" defaultValueComputed="gen_random_uuid()">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="arrival_id" type="UUID">
+                <constraints nullable="false"/>
+            </column>
+            <column name="client" type="VARCHAR(16)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="source_msg_id" type="VARCHAR(35)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="run_date" type="DATE">
+                <constraints nullable="false"/>
+            </column>
+            <column name="applied_max" type="INT">
+                <constraints nullable="false"/>
+            </column>
+            <column name="total_tx" type="BIGINT">
+                <constraints nullable="false"/>
+            </column>
+            <column name="total_amount" type="DECIMAL(18,2)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="expected_batch_count" type="INT">
+                <constraints nullable="false"/>
+            </column>
+            <column name="split" type="BOOLEAN">
+                <constraints nullable="false"/>
+            </column>
+            <column name="version" type="BIGINT" defaultValueNumeric="0">
+                <constraints nullable="false"/>
+            </column>
+            <column name="created_at" type="TIMESTAMPTZ" defaultValueComputed="now()">
+                <constraints nullable="false"/>
+            </column>
+            <column name="updated_at" type="TIMESTAMPTZ" defaultValueComputed="now()">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+        <addUniqueConstraint tableName="crw_emission_group" columnNames="arrival_id, run_date"
+                             constraintName="uq_emission_group_arrival_run"/>
+        <addUniqueConstraint tableName="crw_emission_group" columnNames="client, source_msg_id, run_date"
+                             constraintName="uq_emission_group_client_msg_run"/>
+        <rollback>
+            <dropTable tableName="crw_emission_group"/>
+        </rollback>
+    </changeSet>
+
+    <!-- Batch grain (SCRUM-55): one row per outbound pain.008 artifact. state is
+         VARCHAR(32) from the start rather than the original VARCHAR(16) widened by a
+         later modifyDataType, because PLANNED -> MATERIALIZED -> VISIBLE already needs
+         13 characters and publication sub-states want headroom. -->
+    <changeSet id="crw-v1-emission" author="dcre">
+        <createTable tableName="crw_emission">
+            <column name="id" type="UUID" defaultValueComputed="gen_random_uuid()">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="group_id" type="UUID"/>
+            <column name="arrival_id" type="UUID">
+                <constraints nullable="false"/>
+            </column>
+            <column name="run_date" type="DATE">
+                <constraints nullable="false"/>
+            </column>
+            <column name="batch_ordinal" type="INT" defaultValueNumeric="1">
+                <constraints nullable="false"/>
+            </column>
+            <column name="outbound_msg_id" type="VARCHAR(64)"/>
+            <column name="file_name" type="VARCHAR(128)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="state" type="VARCHAR(32)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="tx_count" type="BIGINT"/>
+            <column name="control_sum" type="DECIMAL(18,2)"/>
+            <column name="visible_at" type="TIMESTAMPTZ"/>
+            <column name="version" type="BIGINT" defaultValueNumeric="0">
+                <constraints nullable="false"/>
+            </column>
+            <column name="created_at" type="TIMESTAMPTZ" defaultValueComputed="now()">
+                <constraints nullable="false"/>
+            </column>
+            <column name="updated_at" type="TIMESTAMPTZ" defaultValueComputed="now()">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+        <!-- The restart key. A subset of this tuple silently swallows a distinct
+             batch's claim and reports the restart as a no-op. -->
+        <addUniqueConstraint tableName="crw_emission" columnNames="arrival_id, run_date, batch_ordinal"
+                             constraintName="uq_emission_arrival_run_ordinal"/>
+        <!-- One physical artifact per outbound MsgId, across run dates: a matured
+             warehoused re-emission continues the sequence rather than reusing a name. -->
+        <createIndex tableName="crw_emission" indexName="uq_emission_outbound_msg" unique="true">
+            <column name="outbound_msg_id"/>
+        </createIndex>
+        <rollback>
+            <dropTable tableName="crw_emission"/>
+        </rollback>
+    </changeSet>
+
+    <!-- Member grain: the immutable frozen snapshot each pain.008 is built from
+         (R-24). The file is never built from the live spine selection. -->
+    <changeSet id="crw-v1-emission-member" author="dcre">
+        <createTable tableName="crw_emission_member">
+            <column name="id" type="UUID" defaultValueComputed="gen_random_uuid()">
+                <constraints primaryKey="true" nullable="false"/>
+            </column>
+            <column name="emission_id" type="UUID">
+                <constraints nullable="false"/>
+            </column>
+            <column name="sequence" type="INT">
+                <constraints nullable="false"/>
+            </column>
+            <column name="e2e" type="VARCHAR(35)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="amount" type="DECIMAL(18,2)">
+                <constraints nullable="false"/>
+            </column>
+            <column name="version" type="BIGINT" defaultValueNumeric="0">
+                <constraints nullable="false"/>
+            </column>
+            <column name="created_at" type="TIMESTAMPTZ" defaultValueComputed="now()">
+                <constraints nullable="false"/>
+            </column>
+            <column name="updated_at" type="TIMESTAMPTZ" defaultValueComputed="now()">
+                <constraints nullable="false"/>
+            </column>
+        </createTable>
+        <addUniqueConstraint tableName="crw_emission_member" columnNames="emission_id, sequence"
+                             constraintName="uq_emission_member_emission_seq"/>
+        <rollback>
+            <dropTable tableName="crw_emission_member"/>
+        </rollback>
+    </changeSet>
+
+</databaseChangeLog>

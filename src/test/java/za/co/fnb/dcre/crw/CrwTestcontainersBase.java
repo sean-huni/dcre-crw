@@ -39,16 +39,25 @@ public abstract class CrwTestcontainersBase {
     protected JdbcTemplate jdbc;
 
     /**
-     * Cross-service spine tables the CRW queries read (CRR/AIS owned in
-     * production): tx_header carries flow (SCRUM-69, default COL) and
-     * ais_verdict backs the pay-flow eligibility arm. SINGLE DDL source for
-     * every crw test context (review m3): CrwJobTest, the BDD glue and the
-     * lane IT call this static against their own datasource.
+     * Cross-service spine tables the CRW queries read: tx_header and tx_entry
+     * (CRR's), validation_log (CTV's) and cde_schedule (CDE's). SINGLE DDL
+     * source for every crw test context (review m3): CrwJobTest, the BDD glue
+     * and the lane IT call this static against their own datasource.
+     *
+     * <p>No flow column and no ais_verdict table. Both existed for the
+     * payments lane, which is PRW's; tx_header.flow is being deleted
+     * fleet-wide because it existed only to let two bounded contexts share one
+     * table, and no changelog in the estate ever created ais_verdict.
+     *
+     * <p>{@code client_token} IS here, at CRR's shape and nullability (A-43): it is the
+     * outbound client authority CRW now reads. Its absence was worse than a fixture
+     * monoculture, because a fixture that omits the column the shipped SQL names cannot
+     * express the behaviour in either direction.
      */
     public static void ensureSpineTables(final JdbcTemplate jdbc) {
         jdbc.execute("CREATE TABLE IF NOT EXISTS tx_header (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
                 + " arrival_id UUID UNIQUE, msg_id VARCHAR(35), initg_pty VARCHAR(35),"
-                + " flow VARCHAR(8) NOT NULL DEFAULT 'COL',"
+                + " client_token VARCHAR(16),"
                 + " created_at TIMESTAMPTZ NOT NULL DEFAULT now())");
         jdbc.execute("CREATE TABLE IF NOT EXISTS tx_entry (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
                 + " arrival_id UUID, sequence INT, e2e VARCHAR(35), amount DECIMAL(18,2), UNIQUE (arrival_id, sequence))");
@@ -56,8 +65,6 @@ public abstract class CrwTestcontainersBase {
                 + " arrival_id UUID, sequence INT, outcome VARCHAR(32), UNIQUE (arrival_id, sequence))");
         jdbc.execute("CREATE TABLE IF NOT EXISTS cde_schedule (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
                 + " arrival_id UUID, sequence INT, process_date DATE, UNIQUE (arrival_id, sequence))");
-        jdbc.execute("CREATE TABLE IF NOT EXISTS ais_verdict (id UUID DEFAULT gen_random_uuid() PRIMARY KEY,"
-                + " arrival_id UUID, sequence INT, action VARCHAR(16), UNIQUE (arrival_id, sequence))");
     }
 
     /** Instance convenience over the shared static DDL source. */
@@ -72,8 +79,29 @@ public abstract class CrwTestcontainersBase {
      */
     protected void seedDueArrival(final UUID arrival, final String client, final String msgId,
             final int total, final LocalDate runDate) {
+        seedDueArrival(arrival, client, client, msgId, total, runDate);
+    }
+
+    /**
+     * The same fixture with the two client homes stated SEPARATELY, so a test can express
+     * an arrival whose R-31 filename token and copybook {@code destination_id} differ, or
+     * one that carries no filename token at all.
+     *
+     * <p>Every other fixture in this suite seeds both columns to the same value, which
+     * makes them structurally incapable of seeing which one CRW reads: the change from
+     * {@code initg_pty} to {@code client_token} would pass them whether it were applied
+     * correctly, incorrectly or not at all. {@code ClientAuthorityIT} is the only caller
+     * that can, and it is the only reason this overload exists.
+     *
+     * @param clientToken the R-31 filename token; {@code null} models a job launched
+     *                    outside AGT, where {@code initg_pty} must carry the emission
+     * @param initgPty    the copybook {@code destination_id}, never null in production
+     */
+    protected void seedDueArrival(final UUID arrival, final String clientToken, final String initgPty,
+            final String msgId, final int total, final LocalDate runDate) {
         ensureSpineTables();
-        jdbc.update("UPSERT INTO tx_header (arrival_id, msg_id, initg_pty) VALUES (?,?,?)", arrival, msgId, client);
+        jdbc.update("UPSERT INTO tx_header (arrival_id, msg_id, initg_pty, client_token) VALUES (?,?,?,?)",
+                arrival, msgId, initgPty, clientToken);
         jdbc.update("INSERT INTO tx_entry (arrival_id, sequence, e2e, amount)"
                 + " SELECT ?, i, 'E2E' || i::STRING, 10.00 FROM generate_series(1, ?) AS g(i)"
                 + " ON CONFLICT (arrival_id, sequence) DO NOTHING", arrival, total);

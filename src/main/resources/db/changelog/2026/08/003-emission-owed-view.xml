@@ -5,15 +5,37 @@
         xsi:schemaLocation="http://www.liquibase.org/xml/ns/dbchangelog
         http://www.liquibase.org/xml/ns/dbchangelog/dbchangelog-latest.xsd">
 
+    <!-- ============================================================================
+         CRW v1 BASELINE, part 3 of 3: the published emission-owed contract.
+
+         THIS IS THE VERSION 1 BASELINE. The database is dropped and recreated at the
+         v1 cutover, so this runs only against an empty schema. Two guards the
+         previous revision carried are deliberately absent:
+
+           - replaceIfExists on the view. It existed so a database where the ORIGINAL
+             changeset had already created the view converged instead of failing. No
+             such database survives the cutover, and a create that cannot collide does
+             not need a replace.
+           - the second changeset id. The previous file carried the create twice under
+             two ids, because databases holding a MARK_RAN row for the first id had to
+             reconsider it. There is no history to reconsider, so there is one id.
+
+         The onFail="CONTINUE" precondition below is NOT scar tissue and STAYS. It is
+         the A-79 fix and it guards a condition that is real on an empty v1 database:
+         the view spans tables owned by three OTHER services, and CRW's window job
+         reaches Liquibase every 10 seconds from cluster start, long before the first
+         DC arrival makes CDE create cde_schedule.
+         ============================================================================ -->
+
     <!--
       SCRUM-107: the PUBLISHED contract for "does this arrival still owe Fintegrate
       an emission?". AGT gates DAG_COMPLETE on it, so a collections arrival can no
       longer report complete before CRW has written anything (R-37 as amended).
 
       Published as a view for the same reason prg_report_due and prg_sla_pending are:
-      CRW owns crw_emission, crw_emission_group, cde_schedule and validation_log, and
-      the completeness rule belongs next to them. AGT reading crw_emission.state
-      directly would couple it to a literal this repo treats as provisional.
+      the completeness RULE is CRW's, so it belongs next to the crw_emission tables
+      that decide it. AGT reading crw_emission.state directly would couple it to a
+      literal this repo treats as provisional.
 
       OWED, not EMITTED. That distinction is the whole point, and getting it wrong
       strands arrivals:
@@ -27,19 +49,28 @@
           batches still undelivered;
         - a multi-process-date arrival owes until the futured remainder has emitted
           too, which is a later run_date and a different group entirely.
+
+      The view spans tables owned by four services in the shared dcre_col: tx_header
+      (CRR), validation_log (CTV), cde_schedule (CDE) and crw_emission/_group (CRW).
+      Which of them exist depends on what has run, so the changeset is guarded and
+      RETRIED rather than skipped once.
+
+      A-79 (2026-08-07): MARK_RAN does not mean "skip", it means "record as applied,
+      permanently". The original changeset MARK_RANed on the very first CRW window,
+      before CDE had created cde_schedule, and the view was then never created for the
+      life of that database. AGT fails closed to OWED on the missing relation, which
+      is the right direction and makes it a SILENT permanent hang: every collections
+      arrival sits in DAG_RUNNING forever with no error anywhere. A dependency that
+      has not bootstrapped yet is not work already done. CONTINUE is the retryable
+      skip: skip this run, record NOTHING, re-evaluate next startup.
+
+      The predicate itself is exercised against a real database by EmissionOwedViewIT,
+      which reads the view body out of THIS file so the two cannot drift.
     -->
-    <changeSet id="001-crw-emission-owed-view" author="dcre">
-        <!--
-          The view spans tables owned by four services in the shared dcre_col:
-          tx_header (CRR), validation_log (CTV), cde_schedule (CDE) and
-          crw_emission/_group (CRW). All four exist in the real database; in CRW's
-          own isolated Testcontainers database only CRW's do, so the changeset
-          MARK_RANs there rather than failing the build. The predicate itself is
-          exercised against a real database by AGT's EmissionOwedViewIT, which
-          creates all four tables and this view.
-        -->
-        <preConditions onFail="MARK_RAN">
-            <not><viewExists viewName="crw_emission_owed"/></not>
+    <changeSet id="crw-v1-emission-owed-view" author="dcre">
+        <preConditions onFail="CONTINUE"
+                       onFailMessage="crw_emission_owed not created yet: CRR/CTV/CDE have not all
+                       run on this database. Bootstrap ordering, not a failure; retried next run.">
             <tableExists tableName="tx_header"/>
             <tableExists tableName="validation_log"/>
             <tableExists tableName="cde_schedule"/>

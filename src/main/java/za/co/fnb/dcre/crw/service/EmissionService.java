@@ -80,34 +80,18 @@ public class EmissionService {
      * job goes through the client-scoped overload per lane (SCRUM-55
      * Feature 2).
      *
+     * <p>The due queries read {@code cde_schedule}, {@code validation_log}, {@code tx_entry} and
+     * {@code tx_header}, all owned by other services, and a freshly reset database has none of
+     * them until those services have run. That is NOT guarded (A-76, A-78): a missing peer table
+     * throws and the window fails. The alternative was tried and is worse in the direction that
+     * does not announce itself, because a guarded due-set reports clean, empty windows while
+     * emitting nothing, and since R-37 was amended to gate DAG_COMPLETE on a CRW emission that
+     * leaves every collections arrival in DAG_RUNNING forever with no error anywhere. See
+     * {@link za.co.fnb.dcre.crw.data.repo.CrwDueQueries} and the DueSql javadoc behind it.
+     *
      * @return number of pain.008 FILES emitted for the run date (batch grain).
      */
-    /**
-     * A-76 (SCRUM-107): the due queries read three tables owned by OTHER services, and none of
-     * them exists on a freshly reset database until those services have run. Every CRW window
-     * then died with {@code relation "cde_schedule" does not exist} and burned its relaunch
-     * budget, when the correct answer is simply that nothing is due. Since R-37 was amended to gate DC
-     * DAG_COMPLETE on a CRW emission, that failure also blocked every collections arrival from
-     * ever completing.
-     *
-     * <p>Degrades to a WARN and an empty due-set, per the bootstrap-ordering standard: a
-     * dependency that has not bootstrapped yet is not a failure, it is no work. Scoped to this
-     * ONE table by name, so a genuine typo or a dropped table elsewhere still fails loudly.
-     */
-    private boolean dueDependenciesMissing() {
-        if (emissions.dueQueryTablesExist()) {
-            return false;
-        }
-        log.warn("the due-query peer tables (cde_schedule, validation_log, tx_header) are not all"
-                + " present yet: CDE/CTV/CRR have not run on this database, so nothing is due."
-                + " Bootstrap ordering, not a failure.");
-        return true;
-    }
-
     public int emitDue(final LocalDate runDate) {
-        if (dueDependenciesMissing()) {
-            return 0;
-        }
         warnFutured(emissions.findFuturedCounts(runDate));
         return emitAll(emissions.findDueArrivals(runDate), runDate);
     }
@@ -118,9 +102,6 @@ public class EmissionService {
      * WARNs are client-scoped so parallel lanes never duplicate them.
      */
     public int emitDue(final LocalDate runDate, final String client) {
-        if (dueDependenciesMissing()) {
-            return 0;
-        }
         warnFutured(emissions.findFuturedCounts(runDate, client));
         return emitAll(emissions.findDueArrivals(runDate, client), runDate);
     }
@@ -128,14 +109,11 @@ public class EmissionService {
     /**
      * Lane universe for the partitioner: distinct clients with work due on the run date.
      *
-     * <p>A-76: guarded like the two emitDue paths. This is the entry point the PARTITIONED job
-     * hits FIRST, so guarding only emitDue left the identical failure reachable and the window
-     * still died on a fresh database. Third site of the same shape; the class is now closed.
+     * <p>This is the entry point the PARTITIONED job hits FIRST, so it is the site a fresh
+     * database reaches before either emitDue overload. It reads the same peer tables and, like
+     * them, does not guard their presence.
      */
     public List<String> dueClients(final LocalDate runDate) {
-        if (dueDependenciesMissing()) {
-            return List.of();
-        }
         return emissions.findDueClients(runDate);
     }
 

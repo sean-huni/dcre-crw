@@ -61,10 +61,8 @@ class EmissionServiceRetryTest {
     @BeforeEach
     void setUp() {
         emissions = mock(CrwEmissionRepo.class);
-        // A-76: the due path now short-circuits when the peer tables owned by CDE/CTV/CRR
-        // are absent. A bare mock answers false, which would silently make every emitDue
-        // here a no-op, so the fixture must state that the dependencies are present.
-        when(emissions.dueQueryTablesExist()).thenReturn(true);
+        // A-78 removed the block guard these fixtures had to stub out: arm availability is now
+        // decided inside the composed SQL, where a mock cannot assert it away. Nothing to state.
         members = mock(CrwEmissionMemberRepo.class);
         planner = mock(SplitPlanner.class);
         final ExchangeLayout layout = new ExchangeLayout(root, Map.of("FNBRF01",

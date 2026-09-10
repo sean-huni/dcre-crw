@@ -3,74 +3,105 @@ package za.co.fnb.dcre.crw;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.jdbc.BadSqlGrammarException;
 import za.co.fnb.dcre.crw.service.EmissionService;
 
 import java.time.LocalDate;
 
-import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * A-76 (SCRUM-107), found by the chaos gate on 2026-08-07.
+ * The deliberate inversion of A-76/A-78 that comes with CRW being collections-only.
  *
- * <p>CDE owns {@code cde_schedule} and creates it on its first run, so on a freshly reset
- * database it does not exist. Every 10s CRW window then died with
- * {@code relation "cde_schedule" does not exist} (BackoffLimitExceeded, exit 5), burning the
- * relaunch budget and filling {@code stage_outcome} with TECH_FAILED, when the correct answer
- * is simply that nothing is due.
+ * <p>A-76 made a missing peer table mean "nothing is due", so a CRW window on a database where
+ * CDE had not yet run reported success instead of dying {@code exit 5}. A-78 replaced that with
+ * per-arm composition, and it was defensible ONLY because there were two arms: leaving the pay
+ * arm out still left the collections arm running, so the degradation could never cover the whole
+ * due-set.
  *
- * <p>It stopped being cosmetic once R-37 was amended: DC {@code DAG_COMPLETE} now requires a CRW
- * emission, so a CRW that cannot run at all means no collections arrival can ever complete.
+ * <p>CRW now has one lane. Guarding it is therefore the A-76 shape again, and A-78 already
+ * recorded why that shape is worse than the crash: a collections cluster whose
+ * {@code cde_schedule} never appears would report clean, empty windows forever while emitting
+ * nothing, and since R-37 was amended to gate DAG_COMPLETE on a CRW emission, every collections
+ * arrival would sit in DAG_RUNNING with no error anywhere. A crash is loud. A permanent silent
+ * zero is not.
  *
- * <p>Bootstrap ordering is not failure. A dependency that has not bootstrapped yet is no work.
+ * <p>So this suite asserts the OPPOSITE of what it asserted before: a missing peer table fails
+ * the window, and it fails naming the table, not merely non-zero. An assertion of "throws
+ * something" would also pass if the context failed to start.
  */
 class MissingScheduleTableIT extends CrwTestcontainersBase {
 
     @Autowired
     private EmissionService emissions;
 
+    /** Every peer table back, so suites stay order-independent whichever one a test dropped. */
     @AfterEach
-    void restoreTheTable() {
-        jdbc.execute("CREATE TABLE IF NOT EXISTS cde_schedule ("
-                + "arrival_id UUID NOT NULL, sequence INT NOT NULL, process_date DATE NOT NULL,"
-                + " PRIMARY KEY (arrival_id, sequence))");
+    void restoreEveryPeerTable() {
+        ensureSpineTables();
     }
 
     @Test
-    void anAbsentScheduleTableMeansNothingDueRatherThanAFailedWindow() {
+    void anAbsentScheduleTableFailsTheWindowLoudly() {
         dropWithDependents("cde_schedule");
 
-        final int emitted = assertDoesNotThrow(() -> emissions.emitDue(LocalDate.now()),
-                "a CRW window must not fail because CDE has not bootstrapped yet: it burns the"
-                        + " relaunch budget and, since R-37 was amended, blocks DC completion");
-        assertEquals(0, emitted, "nothing is due when no schedule exists");
+        assertThatThrownBy(() -> emissions.emitDue(LocalDate.now()))
+                .as("degrading to nothing-due here is a permanent silent zero: CRW would report"
+                        + " success while every collections arrival hangs in DAG_RUNNING")
+                .isInstanceOf(BadSqlGrammarException.class)
+                .rootCause().hasMessageContaining(missing("cde_schedule"));
     }
 
     @Test
-    void theClientScopedLaneDegradesTheSameWay() {
+    void theClientScopedLaneFailsTheSameWay() {
         dropWithDependents("cde_schedule");
 
-        final int emitted = assertDoesNotThrow(
-                () -> emissions.emitDue(LocalDate.now(), "FNBCC01"),
-                "the per-lane overload takes the same due query and must degrade identically");
-        assertEquals(0, emitted, "nothing is due for the lane either");
+        assertThatThrownBy(() -> emissions.emitDue(LocalDate.now(), "FNBCC01"))
+                .as("the per-lane overload takes the same due query and must fail identically")
+                .isInstanceOf(BadSqlGrammarException.class)
+                .rootCause().hasMessageContaining(missing("cde_schedule"));
     }
 
     /**
-     * The first cut of this fix guarded ONLY cde_schedule. This test caught that it was too
-     * narrow: it died on validation_log, because the same due query joins three tables owned by
-     * three different services and a fresh database has none of them. Dropping any ONE of them
-     * must degrade the same way.
+     * The partitioned job calls this BEFORE either emitDue overload, so it is the site a fresh
+     * database reaches first and the one a guard applied only to emitDue would leave silent.
      */
     @Test
-    void anyOneMissingPeerTableDegradesTheSameWay() {
+    void theLaneUniverseQueryFailsToo() {
+        dropWithDependents("cde_schedule");
+
+        assertThatThrownBy(() -> emissions.dueClients(LocalDate.now()))
+                .isInstanceOf(BadSqlGrammarException.class)
+                .rootCause().hasMessageContaining(missing("cde_schedule"));
+    }
+
+    /**
+     * Hunt the class, not the instance. The due path joins three tables owned by three different
+     * services and a fresh database has none of them, so all three must fail the same way and
+     * each must name ITSELF: a sweep asserting only the exception type would pass while every
+     * case died on the first table dropped.
+     */
+    @Test
+    void anyOneMissingPeerTableFailsTheWindowNamingItself() {
         for (final String table : new String[]{"cde_schedule", "validation_log", "tx_header"}) {
-            restoreAllPeerTables();
+            ensureSpineTables();
             dropWithDependents(table);
-            assertEquals(0, assertDoesNotThrow(() -> emissions.emitDue(LocalDate.now()),
-                            "a missing " + table + " must mean nothing due, not a failed window"),
-                    "nothing is due without " + table);
+
+            assertThatThrownBy(() -> emissions.emitDue(LocalDate.now()))
+                    .as("a missing %s must fail the window, not silently empty it", table)
+                    .isInstanceOf(BadSqlGrammarException.class)
+                    .rootCause().hasMessageContaining(missing(table));
         }
+    }
+
+    /**
+     * The ROOT cause text, not the wrapper's. BadSqlGrammarException embeds the whole failing
+     * statement in its message, and every one of these statements NAMES all three tables, so
+     * asserting the table name against the wrapper passes whichever relation was actually
+     * missing: one test, three reasons to go green.
+     */
+    private String missing(final String table) {
+        return "relation \"" + table + "\" does not exist";
     }
 
     /**
@@ -80,27 +111,5 @@ class MissingScheduleTableIT extends CrwTestcontainersBase {
      */
     private void dropWithDependents(final String table) {
         jdbc.execute("DROP TABLE IF EXISTS " + table + " CASCADE");
-    }
-
-    /**
-     * The partitioned job calls this BEFORE emitDue, so guarding only emitDue left the window
-     * still dying on a fresh database. Verified in-cluster: the pod ran the fixed image and
-     * still failed, which is what exposed the third site.
-     */
-    @Test
-    void theLaneUniverseQueryDegradesToo() {
-        dropWithDependents("cde_schedule");
-        assertEquals(0, assertDoesNotThrow(() -> emissions.dueClients(LocalDate.now()),
-                        "dueClients is the partitioner's first call and must not fail the window")
-                .size(), "no lanes when nothing can be due");
-    }
-
-    private void restoreAllPeerTables() {
-        restoreTheTable();
-        jdbc.execute("CREATE TABLE IF NOT EXISTS validation_log ("
-                + "arrival_id UUID NOT NULL, sequence INT NOT NULL, outcome VARCHAR(32) NOT NULL,"
-                + " PRIMARY KEY (arrival_id, sequence))");
-        jdbc.execute("CREATE TABLE IF NOT EXISTS tx_header ("
-                + "arrival_id UUID PRIMARY KEY, initg_pty VARCHAR(16))");
     }
 }
