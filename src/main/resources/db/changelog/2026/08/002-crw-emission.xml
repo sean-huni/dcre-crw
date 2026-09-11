@@ -50,6 +50,14 @@
          VISIBLE batches against, so an arrival owes Fintegrate until EVERY planned
          batch is out, not until the first one is. -->
     <changeSet id="crw-v1-emission-group" author="dcre">
+        <!-- A-82: this changeset gained a re-run guard AFTER it had already been applied,
+             which changes the enclosing checksum without changing one byte of the DDL
+             below. ANY rather than a pinned value: kind-dcre-dev stored 9:19f96a4dea585992aa9dc52c996581a9,
+             and every environment that migrated at a different time holds a different
+             one, so a pin is correct on exactly one database and silently wrong on the
+             rest. The preConditions block is what keeps the re-run safe; the checksum
+             is not load-bearing here. Same call, same reason, as prr 002-batch-metadata. -->
+        <validCheckSum>ANY</validCheckSum>
         <preConditions onFail="MARK_RAN">
             <not><tableExists tableName="crw_emission_group"/></not>
         </preConditions>
@@ -109,6 +117,14 @@
          later modifyDataType, because PLANNED -> MATERIALIZED -> VISIBLE already needs
          13 characters and publication sub-states want headroom. -->
     <changeSet id="crw-v1-emission" author="dcre">
+        <!-- A-82: this changeset gained a re-run guard AFTER it had already been applied,
+             which changes the enclosing checksum without changing one byte of the DDL
+             below. ANY rather than a pinned value: kind-dcre-dev stored 9:0a379d17b3a030dd80e1fe9e35042dd2,
+             and every environment that migrated at a different time holds a different
+             one, so a pin is correct on exactly one database and silently wrong on the
+             rest. The preConditions block is what keeps the re-run safe; the checksum
+             is not load-bearing here. Same call, same reason, as prr 002-batch-metadata. -->
+        <validCheckSum>ANY</validCheckSum>
         <preConditions onFail="MARK_RAN">
             <not><tableExists tableName="crw_emission"/></not>
         </preConditions>
@@ -164,6 +180,14 @@
     <!-- Member grain: the immutable frozen snapshot each pain.008 is built from
          (R-24). The file is never built from the live spine selection. -->
     <changeSet id="crw-v1-emission-member" author="dcre">
+        <!-- A-82: this changeset gained a re-run guard AFTER it had already been applied,
+             which changes the enclosing checksum without changing one byte of the DDL
+             below. ANY rather than a pinned value: kind-dcre-dev stored 9:a6c0ff0b977a9eb60601484956060198,
+             and every environment that migrated at a different time holds a different
+             one, so a pin is correct on exactly one database and silently wrong on the
+             rest. The preConditions block is what keeps the re-run safe; the checksum
+             is not load-bearing here. Same call, same reason, as prr 002-batch-metadata. -->
+        <validCheckSum>ANY</validCheckSum>
         <preConditions onFail="MARK_RAN">
             <not><tableExists tableName="crw_emission_member"/></not>
         </preConditions>

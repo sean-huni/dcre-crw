@@ -77,7 +77,7 @@
             <tableExists tableName="crw_emission_group"/>
         </preConditions>
 
-        <createView viewName="crw_emission_owed" fullDefinition="false">
+        <createView viewName="crw_emission_owed" fullDefinition="false" replaceIfExists="true">
             SELECT h.arrival_id AS arrival_id,
                    (
                      EXISTS (
