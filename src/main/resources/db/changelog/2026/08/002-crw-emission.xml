@@ -50,6 +50,10 @@
          VISIBLE batches against, so an arrival owes Fintegrate until EVERY planned
          batch is out, not until the first one is. -->
     <changeSet id="crw-v1-emission-group" author="dcre">
+        <preConditions onFail="MARK_RAN">
+            <not><tableExists tableName="crw_emission_group"/></not>
+        </preConditions>
+        
         <createTable tableName="crw_emission_group">
             <column name="id" type="UUID" defaultValueComputed="gen_random_uuid()">
                 <constraints primaryKey="true" nullable="false"/>
@@ -105,6 +109,10 @@
          later modifyDataType, because PLANNED -> MATERIALIZED -> VISIBLE already needs
          13 characters and publication sub-states want headroom. -->
     <changeSet id="crw-v1-emission" author="dcre">
+        <preConditions onFail="MARK_RAN">
+            <not><tableExists tableName="crw_emission"/></not>
+        </preConditions>
+        
         <createTable tableName="crw_emission">
             <column name="id" type="UUID" defaultValueComputed="gen_random_uuid()">
                 <constraints primaryKey="true" nullable="false"/>
@@ -156,6 +164,10 @@
     <!-- Member grain: the immutable frozen snapshot each pain.008 is built from
          (R-24). The file is never built from the live spine selection. -->
     <changeSet id="crw-v1-emission-member" author="dcre">
+        <preConditions onFail="MARK_RAN">
+            <not><tableExists tableName="crw_emission_member"/></not>
+        </preConditions>
+        
         <createTable tableName="crw_emission_member">
             <column name="id" type="UUID" defaultValueComputed="gen_random_uuid()">
                 <constraints primaryKey="true" nullable="false"/>
